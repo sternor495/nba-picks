@@ -868,10 +868,37 @@ async function route() {
   if (gid) await openGroup(gid.replace(/[^a-z0-9]/gi, '').slice(0, 20));
   else { unsubMembers?.(); S.view = 'home'; render(); }
 }
+// Move a player made in demo mode (before the database was connected) into the database,
+// keeping their name, code, picks and groups (with the same links).
+async function migrateDemo() {
+  const d = store.get('hs-localdb', null), pid = store.get('hs-session', null);
+  const me = d?.players?.[pid], pin = d?.pins?.[pid];
+  if (api.mode !== 'cloud' || S.profile || !me || !/^[0-9]{4}$/.test(pin || '')) return;
+  try { S.profile = await api.register(me.name, pin); }
+  catch (e) {
+    if (!(e instanceof NameTaken)) throw e;
+    // Same name already in the database: if the code matches, it's the same person.
+    const hit = (await api.search(me.name)).find(r => r.name.toLowerCase() === me.name.toLowerCase());
+    try { S.profile = hit ? await api.login(hit.pid, pin) : null; } catch { S.profile = null; }
+    if (!S.profile) return;
+  }
+  const picks = d.picks?.[pid];
+  if (picks && !isLocked()) { await api.savePicks(picks); S.picks = picks; S.profile = { ...S.profile, done: true }; }
+  else S.picks = await api.getPicks();
+  for (const [id, g] of Object.entries(d.groups || {})) {
+    if (isMain(id) || !g.members?.[pid]) continue;
+    if (await api.getGroup(id)) await api.joinGroup(id); else await api.createGroup(String(g.name).slice(0, 40), id);
+    rememberGroup(id, g.name);
+  }
+  store.set('hs-localdb-moved', d); store.del('hs-localdb'); store.del('hs-session');
+  setTimeout(() => toast(`Welcome back, ${S.profile.name}! Your picks and groups are saved for everyone now.`), 600);
+}
+
 async function boot() {
   try {
     api = window.FIREBASE_CONFIG ? await firebaseApi(window.FIREBASE_CONFIG) : localApi();
     [S.profile, S.picks] = await Promise.all([api.me(), api.getPicks()]);
+    await migrateDemo().catch(e => console.error('demo move failed', e));
   } catch (e) { console.error(e); S.err = 'Could not connect to the game server. Check your connection and reload.'; S.view = 'error'; render(); return; }
   await route();
 }
