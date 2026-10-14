@@ -1,6 +1,12 @@
-// Firebase web config (Project settings → Your apps → Web app → Config).
-// While this is null the site runs in single-browser demo mode.
-window.FIREBASE_CONFIG = null;
+// Firebase web config (public by design; access is controlled by firestore.rules).
+window.FIREBASE_CONFIG = {
+  apiKey: "AIzaSyA4XNqZ7a1wDAYrbCvznthQGMga9KRmAls",
+  authDomain: "hoops-standings.firebaseapp.com",
+  projectId: "hoops-standings",
+  storageBucket: "hoops-standings.firebasestorage.app",
+  messagingSenderId: "37148472744",
+  appId: "1:37148472744:web:f7d3b26702d2f6747f199d",
+};
 
 // Picks lock at the end of October: Sat Oct 31, 2026, 11:59 PM ET (Nov 1 03:59 UTC).
 // If you change this, change the same number in firestore.rules.
