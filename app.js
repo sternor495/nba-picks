@@ -1,10 +1,11 @@
 (() => {
 'use strict';
 const TEAMS = window.TEAMS, PLAYERS = window.PLAYERS;
-const LOCK = window.LOCK_AT, SEASON = window.SEASON;
+const LOCK = window.LOCK_AT, SEASON = window.SEASON, MAIN = window.MAIN_GROUP;
 const teamBy = Object.fromEntries(TEAMS.map(t => [t.a, t]));
 const playerBy = Object.fromEntries(PLAYERS.map(p => [p.id, p]));
 const $app = document.getElementById('app');
+const LOCK_TEXT = 'Saturday, Oct 31, 2026, 11:59 PM ET';
 
 /* ---------- helpers ---------- */
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -15,7 +16,7 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
   del(k) { try { localStorage.removeItem(k); } catch {} },
 };
-const randId = n => { const a = 'abcdefghijkmnpqrstuvwxyz23456789'; let s = ''; const r = crypto.getRandomValues(new Uint8Array(n)); for (const x of r) s += a[x % a.length]; return s; };
+const randId = n => { const a = 'abcdefghijkmnpqrstuvwxyz23456789'; let s = ''; for (const x of crypto.getRandomValues(new Uint8Array(n))) s += a[x % a.length]; return s; };
 const hue = s => { let h = 0; for (const c of String(s)) h = (h * 31 + c.charCodeAt(0)) % 360; return h; };
 const avatar = name => `<span class="av" style="background:hsl(${hue(name)} 55% 45%)">${esc((name || '?').trim()[0]?.toUpperCase() || '?')}</span>`;
 const isLocked = () => Date.now() >= LOCK;
@@ -23,6 +24,7 @@ const fmt = n => (Math.round(n * 10) / 10).toLocaleString('en-US');
 const ord = n => n + (['th','st','nd','rd'][(n % 100 - 20) % 10] || ['th','st','nd','rd'][n % 100] || 'th');
 const confTeams = c => TEAMS.filter(t => t.c === c);
 const CONF = { east: { key: 'E', name: 'East' }, west: { key: 'W', name: 'West' } };
+const isMain = id => id === MAIN.id;
 
 /* ---------- scoring (the rules, in code) ---------- */
 const placeValue = p => 100 - 5 * (p - 1);                       // 1st 100 … 10th 55
@@ -91,30 +93,31 @@ async function getLive(force) {
   return liveCache;
 }
 
-/* ---------- backends ---------- */
+/* ---------- backends ----------
+   Data model: profiles/{uid} {name, done} · picks/{uid} {east, west, players} · groups/{id} {name, owner} · groups/{id}/members/{uid} */
 function localApi() {
-  const KEY = 'ho-localdb';
-  const load = () => store.get(KEY, { groups: {} });
+  const KEY = 'hs-localdb';
+  const load = () => store.get(KEY, { profiles: {}, picks: {}, groups: {} });
   const save = db => store.set(KEY, db);
-  let uid = store.get('ho-uid'); if (!uid) { uid = randId(12); store.set('ho-uid', uid); }
+  let uid = store.get('hs-uid'); if (!uid) { uid = randId(12); store.set('hs-uid', uid); }
   const listeners = new Set();
   const ping = () => listeners.forEach(f => f());
+  const ensure = (db, id, name, owner) => { db.groups[id] = db.groups[id] || { name, owner, members: {} }; return db.groups[id]; };
   return {
     mode: 'local', uid,
-    async createGroup(name, myName) {
-      const db = load(), id = randId(8);
-      db.groups[id] = { name, owner: uid, createdAt: Date.now(), members: { [uid]: { name: myName, done: false, joinedAt: Date.now() } }, entries: {} };
-      save(db); return id;
-    },
-    async getGroup(id) { const g = load().groups[id]; return g ? { id, name: g.name, owner: g.owner } : null; },
-    async join(id, name) { const db = load(); const m = db.groups[id].members; m[uid] = { ...(m[uid] || { done: false, joinedAt: Date.now() }), name }; save(db); ping(); },
+    async getProfile() { return load().profiles[uid] || null; },
+    async setProfile(name) { const db = load(); db.profiles[uid] = { done: false, ...db.profiles[uid], name }; save(db); ping(); },
+    async createGroup(name) { const db = load(), id = randId(8); ensure(db, id, name, uid).members[uid] = Date.now(); save(db); return id; },
+    async getGroup(id) { const db = load(); if (isMain(id)) { ensure(db, id, MAIN.name, 'system'); save(db); } const g = db.groups[id]; return g ? { id, name: g.name, owner: g.owner } : null; },
+    async joinGroup(id) { const db = load(); const g = isMain(id) ? ensure(db, id, MAIN.name, 'system') : db.groups[id]; if (g && !g.members[uid]) { g.members[uid] = Date.now(); save(db); ping(); } },
+    async myGroupIds() { const db = load(); return Object.entries(db.groups).filter(([, g]) => g.members[uid]).map(([id, g]) => ({ id, name: g.name })); },
     watchMembers(id, cb) {
-      const f = () => { const g = load().groups[id]; cb(Object.entries(g?.members || {}).map(([u, m]) => ({ uid: u, ...m }))); };
+      const f = () => { const db = load(); const g = db.groups[id]; cb(Object.entries(g?.members || {}).map(([u, t]) => ({ uid: u, joinedAt: t, ...(db.profiles[u] || { name: '?', done: false }) }))); };
       listeners.add(f); f(); return () => listeners.delete(f);
     },
-    async getEntry(id) { return load().groups[id]?.entries[uid] || null; },
-    async saveEntry(id, entry) { if (isLocked()) throw new Error('locked'); const db = load(); const g = db.groups[id]; g.entries[uid] = entry; g.members[uid] = { ...g.members[uid], name: entry.name, done: true }; save(db); ping(); },
-    async entries(id) { const g = load().groups[id]; return Object.entries(g?.entries || {}).filter(([u]) => isLocked() || u === uid).map(([u, e]) => ({ uid: u, ...e })); },
+    async getPicks() { return load().picks[uid] || null; },
+    async savePicks(p) { if (isLocked()) throw new Error('locked'); const db = load(); db.picks[uid] = p; db.profiles[uid] = { ...db.profiles[uid], done: true }; save(db); ping(); },
+    async allPicks() { const db = load(); return Object.entries(db.picks).filter(([u]) => isLocked() || u === uid).map(([u, e]) => ({ uid: u, ...e, name: db.profiles[u]?.name || '?' })); },
   };
 }
 
@@ -126,39 +129,51 @@ async function firebaseApi(cfg) {
   await Promise.all([loadScript(`https://www.gstatic.com/firebasejs/${v}/firebase-auth-compat.js`), loadScript(`https://www.gstatic.com/firebasejs/${v}/firebase-firestore-compat.js`)]);
   firebase.initializeApp(cfg);
   const auth = firebase.auth(), db = firebase.firestore();
-  const user = auth.currentUser || await new Promise((res, rej) => {
-    const off = auth.onAuthStateChanged(u => { if (u) { off(); res(u); } });
-    auth.signInAnonymously().catch(rej);
+  const user = await new Promise((res, rej) => {
+    const off = auth.onAuthStateChanged(u => { if (u) { off(); res(u); } else auth.signInAnonymously().catch(rej); });
   });
   const uid = user.uid;
   const G = id => db.collection('groups').doc(id);
   const now = firebase.firestore.FieldValue.serverTimestamp;
+  // Profiles are shared by every group view; keep one live subscription.
+  let profiles = {}; const profSubs = new Set();
+  db.collection('profiles').onSnapshot(q => { profiles = Object.fromEntries(q.docs.map(d => [d.id, d.data()])); profSubs.forEach(f => f()); }, e => console.error(e));
   return {
     mode: 'cloud', uid,
-    async createGroup(name, myName) {
+    async getProfile() { const s = await db.collection('profiles').doc(uid).get(); return s.exists ? s.data() : null; },
+    async setProfile(name) { const ref = db.collection('profiles').doc(uid); const s = await ref.get(); await ref.set(s.exists ? { name } : { name, done: false }, { merge: true }); },
+    async createGroup(name) {
       const id = randId(8);
       await G(id).set({ name, owner: uid, createdAt: now() });
-      await G(id).collection('members').doc(uid).set({ name: myName, done: false, joinedAt: now() });
+      await G(id).collection('members').doc(uid).set({ joinedAt: now() });
       return id;
     },
-    async getGroup(id) { const s = await G(id).get(); return s.exists ? { id, ...s.data() } : null; },
-    async join(id, name) {
+    async getGroup(id) {
+      let s = await G(id).get();
+      if (!s.exists && isMain(id)) { await G(id).set({ name: MAIN.name, owner: 'system', createdAt: now() }).catch(() => {}); s = await G(id).get(); }
+      return s.exists ? { id, ...s.data() } : null;
+    },
+    async joinGroup(id) {
       const ref = G(id).collection('members').doc(uid);
-      const s = await ref.get();
-      await ref.set(s.exists ? { name } : { name, done: false, joinedAt: now() }, { merge: true });
+      if (!(await ref.get()).exists) await ref.set({ joinedAt: now() });
     },
+    async myGroupIds() { return null; },
     watchMembers(id, cb) {
-      return G(id).collection('members').onSnapshot(q => cb(q.docs.map(d => ({ uid: d.id, ...d.data(), joinedAt: d.data().joinedAt?.toMillis?.() || 0 }))), e => console.error(e));
+      let members = [];
+      const emit = () => cb(members.map(m => ({ ...m, ...(profiles[m.uid] || { name: '…', done: false }) })));
+      profSubs.add(emit);
+      const off = G(id).collection('members').onSnapshot(q => { members = q.docs.map(d => ({ uid: d.id, joinedAt: d.data().joinedAt?.toMillis?.() || Date.now() })); emit(); }, e => console.error(e));
+      return () => { off(); profSubs.delete(emit); };
     },
-    async getEntry(id) { const s = await G(id).collection('entries').doc(uid).get(); return s.exists ? s.data() : null; },
-    async saveEntry(id, entry) {
-      await G(id).collection('entries').doc(uid).set({ ...entry, savedAt: now() });
-      await G(id).collection('members').doc(uid).set({ name: entry.name, done: true }, { merge: true });
+    async getPicks() { const s = await db.collection('picks').doc(uid).get(); return s.exists ? s.data() : null; },
+    async savePicks(p) {
+      await db.collection('picks').doc(uid).set({ ...p, savedAt: now() });
+      await db.collection('profiles').doc(uid).set({ done: true }, { merge: true });
     },
-    async entries(id) {
-      if (!isLocked()) { const e = await this.getEntry(id); return e ? [{ uid, ...e }] : []; }
-      const q = await G(id).collection('entries').get();
-      return q.docs.map(d => ({ uid: d.id, ...d.data() }));
+    async allPicks() {
+      if (!isLocked()) { const e = await this.getPicks(); return e ? [{ uid, ...e, name: profiles[uid]?.name }] : []; }
+      const q = await db.collection('picks').get();
+      return q.docs.map(d => ({ uid: d.id, ...d.data(), name: profiles[d.id]?.name || '?' }));
     },
   };
 }
@@ -167,18 +182,21 @@ async function firebaseApi(cfg) {
 let api = null;
 const S = {
   view: 'loading',        // loading | home | join | group | pick | missing | error
-  gid: null, group: null, members: [], entry: null,
-  tab: 'squad', step: 0, draft: null,
+  profile: null, picks: null,
+  gid: null, group: null, members: [],
+  tab: 'board', step: 0, draft: null, back: null,
   pq: '', ppos: 'All', openUid: null,
   lb: null, lbErr: null, err: '', busy: false,
 };
 let unsubMembers = null;
 
-const myGroups = () => store.get('ho-groups', []);
-function rememberGroup(id, name) { const g = myGroups().filter(x => x.id !== id); g.unshift({ id, name }); store.set('ho-groups', g.slice(0, 12)); }
-const draftKey = () => `ho-draft-${S.gid}`;
-function saveDraft() { store.set(draftKey(), S.draft); }
-const me = () => S.members.find(m => m.uid === api.uid);
+function myGroups() {
+  const g = store.get('hs-groups', []).filter(x => !isMain(x.id));
+  return [{ id: MAIN.id, name: MAIN.name }, ...g];
+}
+function rememberGroup(id, name) { if (isMain(id)) return; const g = store.get('hs-groups', []).filter(x => x.id !== id); g.unshift({ id, name }); store.set('hs-groups', g.slice(0, 20)); }
+const DRAFT = 'hs-draft';
+function saveDraft() { store.set(DRAFT, S.draft); }
 const inviteUrl = () => `${location.origin}${location.pathname}?g=${S.gid}`;
 
 /* ---------- small UI bits ---------- */
@@ -187,29 +205,27 @@ const COURT = `<svg class="court" viewBox="0 0 500 470" fill="none" stroke="curr
 
 function countdown(compact) {
   let ms = LOCK - Date.now();
-  if (ms <= 0) return `<span class="pill">🔒 Season live</span>`;
+  if (ms <= 0) return `<span class="pill">🔒 Picks locked</span>`;
   const d = Math.floor(ms / 864e5); ms -= d * 864e5;
   const h = Math.floor(ms / 36e5); ms -= h * 36e5;
   const m = Math.floor(ms / 6e4); const s = Math.floor((ms - m * 6e4) / 1e3);
   if (compact) return `<span class="pill num" data-clock="1">⏱ Locks in ${d}d ${h}h</span>`;
   return `<div class="clock num" data-clock="0">${[[d,'days'],[h,'hrs'],[m,'min'],[s,'sec']].map(([v,l]) => `<div><b>${String(v).padStart(2,'0')}</b><small>${l}</small></div>`).join('')}</div>`;
 }
-setInterval(() => {
-  document.querySelectorAll('[data-clock]').forEach(el => { el.outerHTML = countdown(el.dataset.clock === '1'); });
-}, 1000);
+setInterval(() => { document.querySelectorAll('[data-clock]').forEach(el => { el.outerHTML = countdown(el.dataset.clock === '1'); }); }, 1000);
 
 function topbar() {
   return `<header class="top"><div class="in">
-    <button class="brand" data-act="home" aria-label="Hoops Oracle home">${BALL}Hoops Oracle</button>
-    <span class="sp"></span>${S.view === 'home' ? '' : countdown(true)}
-  </div></header>${api?.mode === 'local' ? `<div class="demo">Demo mode: picks are saved in this browser only. Group links start working for friends once the shared database is connected.</div>` : ''}`;
+    <button class="brand" data-act="home" aria-label="Hoops Standings home">${BALL}Hoops Standings</button>
+    <span class="sp"></span>${countdown(true)}
+  </div></header>${api?.mode === 'local' ? `<div class="demo">Demo mode: picks are saved in this browser only.</div>` : ''}`;
 }
 
 let toastT;
 function toast(msg) {
   document.querySelector('.toast')?.remove();
   const t = document.createElement('div'); t.className = 'toast'; t.role = 'status'; t.textContent = msg;
-  document.body.appendChild(t); clearTimeout(toastT); toastT = setTimeout(() => t.remove(), 2600);
+  document.body.appendChild(t); clearTimeout(toastT); toastT = setTimeout(() => t.remove(), 2800);
 }
 
 function confetti() {
@@ -237,7 +253,7 @@ function rulesHtml() {
   const ladder = Array.from({ length: 10 }, (_, i) => `<div><b class="num">${placeValue(i + 1)}</b><small>${ord(i + 1)}</small></div>`).join('');
   return `<section class="card stack rules" id="rules">
     <div><p class="eyebrow">How it works</p><h2>The rules</h2></div>
-    <p>Before the season tips off, everyone in your group makes three calls. When the regular season ends, the closest prophet wins.</p>
+    <p>Make three calls about the 2026-27 regular season. When it ends, the closest prediction wins.</p>
 
     <h3>1 · Conference standings</h3>
     <p>Rank the top 10 teams in the East and the West. Each place is worth points:</p>
@@ -277,10 +293,17 @@ function rulesHtml() {
     </div>
     <p class="note good" id="calc-out"></p>
 
+    <h3>Groups</h3>
+    <ul>
+      <li>Everyone plays in the <b>${MAIN.name}</b>, the big leaderboard across all players.</li>
+      <li>Start your own groups for friends, family or work and name them whatever you want. Join as many as you like.</li>
+      <li>You make <b>one set of picks</b>. It counts in every group you're in.</li>
+    </ul>
+
     <h3>The fine print</h3>
     <ul>
-      <li>Picks lock at the opening tip: <b>Tuesday, Oct 20, 2026, 7:00 PM ET</b>. Edit as much as you like until then.</li>
-      <li>Everyone's picks stay secret until lock. Then they're revealed to the group.</li>
+      <li>Picks lock on <b>${LOCK_TEXT}</b>. Join and edit as much as you like until then.</li>
+      <li>Everyone's picks stay secret until lock. Then they're revealed.</li>
       <li>The leaderboard updates live during the season from ESPN data, as if the season ended today. Win totals are projected to an 82-game pace until the season is over.</li>
       <li>Final standings are the regular-season seeds, before the play-in.</li>
       <li>A player who never plays a game scores 0.</li>
@@ -297,25 +320,38 @@ function calcUpdate() {
 }
 
 /* ---------- views ---------- */
+function nameField(id) {
+  return S.profile ? '' : `<div><label class="lbl" for="${id}">Your name</label><input class="txt" id="${id}" maxlength="30" placeholder="What your friends call you" required></div>`;
+}
+
 function viewHome() {
   const gs = myGroups();
+  const p = S.profile;
   return `${topbar()}
   <section class="hero"><div class="in">${COURT}
     <p class="eyebrow">2026-27 NBA season</p>
-    <h1>Call the<br><span>whole season.</span></h1>
-    <p>Rank the top 10 in each conference, predict every team's win total, and draft a starting five with stat lines. Your friends do the same. Closest to the truth in April takes the crown.</p>
-    <p class="small" style="opacity:.75">Picks lock at the opening tip in</p>
+    <h1>Hoops<br><span>Standings.</span></h1>
+    <p>Rank the top 10 in each conference, predict every team's win total, and draft a starting five with stat lines. Play against your friends and everyone in the ${esc(MAIN.name)}.</p>
+    <p class="small" style="opacity:.75">Picks lock at the end of October</p>
     ${countdown(false)}
+    ${p ? `<div class="wrap-row"><button class="btn hot big" data-act="pick">${p.done ? 'Edit my picks' : 'Make my picks'}</button></div>` : ''}
   </div></section>
   <main class="wrap stack" style="margin-top:20px">
-    ${gs.length ? `<section class="card stack"><h3>Your groups</h3><div class="stack" style="gap:8px">${gs.map(g => `<a class="btn" style="justify-content:space-between" href="?g=${esc(g.id)}">${esc(g.name)} <span aria-hidden="true">→</span></a>`).join('')}</div></section>` : ''}
+    ${!p ? `<section class="card stack">
+      <div><p class="eyebrow">Jump in</p><h2>Start playing</h2></div>
+      <p class="muted">No accounts, no passwords. Pick a name and you're in the ${esc(MAIN.name)}.</p>
+      <form id="start" class="stack" autocomplete="off">${nameField('sname')}
+        ${S.err && S.errFor === 'start' ? `<p class="err">${esc(S.err)}</p>` : ''}
+        <button class="btn hot big" ${S.busy ? 'disabled' : ''}>Make my picks</button></form>
+    </section>` : `<section class="card stack"><div class="row"><div class="grow"><p class="eyebrow">Playing as</p><h3>${esc(p.name)}</h3></div>${p.done ? '<span class="badge ok">Picks in ✓</span>' : '<span class="badge wait">Picks not in yet</span>'}</div></section>`}
+    <section class="card stack"><h3>Your groups</h3><div class="stack" style="gap:8px">${gs.map(g => `<a class="btn" style="justify-content:space-between" href="?g=${esc(g.id)}"><span>${isMain(g.id) ? '🏆 ' : ''}${esc(g.name)}</span><span aria-hidden="true">→</span></a>`).join('')}</div></section>
     <section class="card stack">
-      <div><p class="eyebrow">Start a league</p><h2>Create a group</h2></div>
-      <p class="muted">You'll get a link to send your friends. No accounts, no passwords. Whoever has the link can join.</p>
+      <div><p class="eyebrow">For your crew</p><h2>Create a group</h2></div>
+      <p class="muted">Get a link to send your friends. Anyone with the link can join. You'll all still be in the ${esc(MAIN.name)} too.</p>
       <form id="create" class="stack" autocomplete="off">
         <div><label class="lbl" for="gname">Group name</label><input class="txt" id="gname" maxlength="40" placeholder="Sunday Hoopers" required></div>
-        <div><label class="lbl" for="myname">Your name</label><input class="txt" id="myname" maxlength="30" placeholder="Oren" required></div>
-        ${S.err ? `<p class="err">${esc(S.err)}</p>` : ''}
+        ${nameField('myname')}
+        ${S.err && S.errFor === 'create' ? `<p class="err">${esc(S.err)}</p>` : ''}
         <button class="btn hot big" ${S.busy ? 'disabled' : ''}>${S.busy ? 'Creating…' : 'Create group'}</button>
       </form>
     </section>
@@ -324,41 +360,36 @@ function viewHome() {
 }
 
 function viewJoin() {
-  const locked = isLocked();
   return `${topbar()}
   <section class="hero"><div class="in">${COURT}
     <p class="eyebrow">You're invited</p>
     <h1>${esc(S.group.name)}</h1>
-    <p>${S.members.length} ${S.members.length === 1 ? 'prophet has' : 'prophets have'} joined so far${S.members.length ? ': ' + S.members.slice(0, 6).map(m => esc(m.name)).join(', ') + (S.members.length > 6 ? '…' : '') : ''}.</p>
+    <p>${S.members.length} ${S.members.length === 1 ? 'player has' : 'players have'} joined${S.members.length ? ': ' + S.members.slice(0, 6).map(m => esc(m.name)).join(', ') + (S.members.length > 6 ? '…' : '') : ''}. Call the 2026-27 NBA standings and your starting five.</p>
     ${countdown(false)}
   </div></section>
   <main class="wrap stack" style="margin-top:20px">
-    ${locked ? `<section class="card stack"><h3>Picks are locked</h3><p>The season has tipped off, so new picks can't be added. You can still watch the leaderboard.</p><button class="btn hot" data-act="spectate">See the leaderboard</button></section>` :
-    `<section class="card stack">
+    <section class="card stack">
       <h2>Join the group</h2>
+      ${isLocked() ? `<p class="muted">Picks are locked for the season, so you can follow along but not play.</p>` : `<p class="muted">You'll also be in the ${esc(MAIN.name)} with everyone else.</p>`}
       <form id="join" class="stack" autocomplete="off">
         <div><label class="lbl" for="jname">What should we call you?</label><input class="txt" id="jname" maxlength="30" placeholder="Your name" required></div>
         ${S.err ? `<p class="err">${esc(S.err)}</p>` : ''}
-        <button class="btn hot big" ${S.busy ? 'disabled' : ''}>Join & make my picks</button>
+        <button class="btn hot big" ${S.busy ? 'disabled' : ''}>${isLocked() ? 'Join to follow' : 'Join & make my picks'}</button>
       </form>
-    </section>`}
+    </section>
     ${rulesHtml()}
   </main>`;
 }
 
 function viewGroup() {
-  const tabs = [['squad', 'Squad'], ['mine', 'My picks'], ['board', 'Leaderboard'], ['rules', 'Rules']];
-  let body = '';
-  if (S.tab === 'squad') body = tabSquad();
-  else if (S.tab === 'mine') body = tabMine();
-  else if (S.tab === 'board') body = tabBoard();
-  else body = rulesHtml();
+  const tabs = [['board', 'Leaderboard'], ['squad', 'Players'], ['mine', 'My picks'], ['rules', 'Rules']];
+  const body = { squad: tabSquad, mine: tabMine, board: tabBoard, rules: rulesHtml }[S.tab]();
   const done = S.members.filter(m => m.done).length;
   return `${topbar()}
   <section class="hero"><div class="in" style="padding-block:24px 22px;gap:10px">${COURT}
-    <p class="eyebrow">Group · ${S.members.length} ${S.members.length === 1 ? 'player' : 'players'} · ${done} locked in</p>
-    <h1 style="font-size:clamp(38px,9vw,64px)">${esc(S.group.name)}</h1>
-    <div class="wrap-row"><button class="btn hot" data-act="invite">Invite friends</button>${!isLocked() && me() ? `<button class="btn" data-act="pick">${me()?.done ? 'Edit my picks' : 'Make my picks'}</button>` : ''}</div>
+    <p class="eyebrow">${isMain(S.gid) ? 'Everyone plays here' : 'Group'} · ${S.members.length} ${S.members.length === 1 ? 'player' : 'players'} · ${done} picks in</p>
+    <h1 style="font-size:clamp(38px,9vw,64px)">${isMain(S.gid) ? '🏆 ' : ''}${esc(S.group.name)}</h1>
+    <div class="wrap-row"><button class="btn hot" data-act="invite">Invite friends</button>${!isLocked() ? `<button class="btn" data-act="pick">${S.profile?.done ? 'Edit my picks' : 'Make my picks'}</button>` : ''}</div>
   </div></section>
   <main class="wrap stack" style="margin-top:16px">
     <nav class="tabs" role="tablist">${tabs.map(([k, l]) => `<button role="tab" aria-selected="${S.tab === k}" class="${S.tab === k ? 'on' : ''}" data-act="tab" data-v="${k}">${l}</button>`).join('')}</nav>
@@ -368,30 +399,28 @@ function viewGroup() {
 
 function tabSquad() {
   const ms = [...S.members].sort((a, b) => (a.joinedAt || 0) - (b.joinedAt || 0));
-  const meM = me();
   return `
-  ${meM && !meM.done && !isLocked() ? `<section class="card stack" style="border-color:var(--hot)"><h3>Your picks aren't in yet</h3><p class="muted">It takes about 5 minutes. You can change them until tip-off.</p><button class="btn hot big" data-act="pick">Make my picks</button></section>` : ''}
+  ${!S.profile?.done && !isLocked() ? `<section class="card stack" style="border-color:var(--hot)"><h3>Your picks aren't in yet</h3><p class="muted">It takes about 5 minutes. You can change them until the end of October.</p><button class="btn hot big" data-act="pick">Make my picks</button></section>` : ''}
   <section class="card stack">
-    <div class="row"><h3 class="grow">Invite link</h3></div>
+    <h3>Invite link</h3>
     <p class="muted small">Anyone with this link can join. Send it in the group chat.</p>
     <div class="row" style="flex-wrap:wrap"><input class="txt grow small" id="invite-url" readonly value="${esc(inviteUrl())}" aria-label="Invite link" style="min-width:200px"><button class="btn hot" data-act="invite">Copy / share</button></div>
   </section>
   <section class="card">
-    <h3 style="margin-bottom:6px">The prophets</h3>
-    ${ms.map(m => `<div class="mem">${avatar(m.name)}<div class="grow"><b>${esc(m.name)}</b>${m.uid === S.group.owner ? ' <span class="muted small">· commissioner</span>' : ''}${m.uid === api.uid ? ' <span class="muted small">· you</span>' : ''}</div>${m.done ? '<span class="badge ok">Picks in ✓</span>' : '<span class="badge wait">Thinking…</span>'}</div>`).join('') || '<p class="muted">No one yet.</p>'}
-  </section>
-  ${!isLocked() ? `<p class="muted small center">Picks are revealed to everyone at tip-off. ${countdown(true)}</p>` : ''}`;
+    <h3 style="margin-bottom:6px">Players</h3>
+    ${ms.map(m => `<div class="mem">${avatar(m.name)}<div class="grow"><b>${esc(m.name)}</b>${m.uid === S.group.owner ? ' <span class="muted small">· started the group</span>' : ''}${m.uid === api.uid ? ' <span class="muted small">· you</span>' : ''}</div>${m.done ? '<span class="badge ok">Picks in ✓</span>' : '<span class="badge wait">Thinking…</span>'}</div>`).join('') || '<p class="muted">No one yet.</p>'}
+  </section>`;
 }
 
 function tabMine() {
-  if (!S.entry) {
-    if (isLocked()) return `<section class="card"><p>You didn't make picks in this group before the season started.</p></section>`;
+  if (!S.picks) {
+    if (isLocked()) return `<section class="card"><p>You didn't make picks before the lock.</p></section>`;
     return `<section class="card stack center"><h3>No picks yet</h3><p class="muted">East, West, then your starting five.</p><button class="btn hot big" data-act="pick">Start picking</button></section>`;
   }
   const live = S.lb?.live || null;
-  const sc = live?.started ? scoreEntry(S.entry, live) : null;
-  return `${!isLocked() ? `<div class="row"><p class="grow muted small">Saved. You can change these until tip-off.</p><button class="btn" data-act="pick">Edit picks</button></div>` : ''}
-  ${picksTables(S.entry, sc)}`;
+  const sc = live?.started ? scoreEntry(S.picks, live) : null;
+  return `${!isLocked() ? `<div class="row"><p class="grow muted small">Saved. These count in all your groups. Change them until the end of October.</p><button class="btn" data-act="pick">Edit picks</button></div>` : ''}
+  ${picksTables(S.picks, sc)}`;
 }
 
 function picksTables(e, sc) {
@@ -407,10 +436,10 @@ function picksTables(e, sc) {
     <h3>West</h3>${conf('west')}
     <h3>Starting five</h3>
     <div class="tbl"><table><thead><tr><th>Player</th><th>PTS</th><th>REB</th><th>AST</th>${sc ? '<th style="text-align:right">Pts</th>' : ''}</tr></thead><tbody>
-    ${prow.map(p => { const pl = playerBy[p.id]; const a = p.act; const cell = (k) => `${p[k]}${sc ? ` <span class="muted small">/ ${a ? fmt(a[k]) : '–'}</span>` : ''}`;
-      return `<tr><td><span class="row" style="gap:8px"><img src="${head(p.id)}" alt="" style="width:34px;height:25px;object-fit:cover;object-position:top;border-radius:4px">${esc(pl?.n || p.name || p.id)}</span></td><td>${cell('pts')}</td><td>${cell('reb')}</td><td>${cell('ast')}</td>${sc ? `<td class="pts">${fmt(p.sum)}</td>` : ''}</tr>`; }).join('')}
+    ${prow.map(p => { const pl = playerBy[p.id]; const a = p.act; const cell = k => `${p[k]}${sc ? ` <span class="muted small">/ ${a ? fmt(a[k]) : '–'}</span>` : ''}`;
+      return `<tr><td><span class="row" style="gap:8px"><img src="${head(p.id)}" alt="" style="width:34px;height:25px;object-fit:cover;object-position:top;border-radius:4px">${esc(pl?.n || p.id)}</span></td><td>${cell('pts')}</td><td>${cell('reb')}</td><td>${cell('ast')}</td>${sc ? `<td class="pts">${fmt(p.sum)}</td>` : ''}</tr>`; }).join('')}
     </tbody></table></div>
-    ${sc ? `<p class="muted small">Your number / current average. Total: <b>${fmt(sc.total)}</b> points.</p>` : ''}
+    ${sc ? `<p class="muted small">Prediction / current average. Total: <b>${fmt(sc.total)}</b> points.</p>` : ''}
   </section>`;
 }
 
@@ -418,25 +447,29 @@ function tabBoard() {
   if (!isLocked()) {
     const done = S.members.filter(m => m.done).length;
     return `<section class="card stack center">
-      <h3>Sealed until tip-off</h3>
-      <p class="muted">${done} of ${S.members.length} have their picks in. Everyone's picks and the live leaderboard appear when the season starts.</p>
+      <h3>Sealed until the end of October</h3>
+      <p class="muted">${done} of ${S.members.length} have their picks in. Everyone's picks and the live leaderboard appear when picks lock.</p>
       ${countdown(false).replace('class="clock', 'style="justify-content:center" class="clock')}
     </section>`;
   }
   if (S.lbErr) return `<section class="card stack"><p class="err">${esc(S.lbErr)}</p><button class="btn" data-act="reload-lb">Try again</button></section>`;
   if (!S.lb) { loadBoard(); return `<section class="card center muted">Loading the scores…</section>`; }
-  const { live, rows } = S.lb;
-  if (!rows.length) return `<section class="card">No one made picks in this group.</section>`;
+  const { live } = S.lb;
+  const inGroup = new Set(S.members.map(m => m.uid));
+  const names = Object.fromEntries(S.members.map(m => [m.uid, m.name]));
+  const rows = S.lb.rows.filter(r => inGroup.has(r.uid)).map(r => ({ ...r, name: names[r.uid] || r.name }));
+  if (!rows.length) return `<section class="card">No one in this group made picks.</section>`;
   const max = Math.max(1, ...rows.map(r => r.sc.total));
   let rank = 0, prev = null;
-  return `<p class="muted small">${live.final ? 'Final results.' : live.started ? 'Live: if the season ended today. Updated from ESPN.' : 'The season has not started yet, so everyone is at 0.'}</p>
+  return `<p class="muted small">${live.final ? 'Final results.' : live.started ? 'Live: if the season ended today. Updated from ESPN.' : 'Waiting for games, so everyone is at 0.'}</p>
   <div class="legend"><span><i class="c1"></i>East places</span><span><i class="c2"></i>West places</span><span><i class="c3"></i>Win totals</span><span><i class="c4"></i>Starting five</span></div>
   <div class="lb">${rows.map((r, i) => {
       if (r.sc.total !== prev) { rank = i + 1; prev = r.sc.total; }
       const w = v => (v / max * 100).toFixed(2) + '%';
       const open = S.openUid === r.uid;
-      return `<button class="lbrow ${rank === 1 && live.started ? 'first' : ''}" data-act="open" data-v="${esc(r.uid)}" aria-expanded="${open}">
-        <span class="pos">${rank === 1 && live.started ? '👑' : rank}</span>
+      const crown = rank === 1 && live.started;
+      return `<button class="lbrow ${crown ? 'first' : ''}" data-act="open" data-v="${esc(r.uid)}" aria-expanded="${open}">
+        <span class="pos">${crown ? '👑' : rank}</span>
         <span class="grow" style="min-width:0"><b>${esc(r.name)}</b>${r.uid === api.uid ? ' <span class="muted small">· you</span>' : ''}
           <span class="bars"><i class="c1" style="width:${w(r.sc.eastPlace)}"></i><i class="c2" style="width:${w(r.sc.westPlace)}"></i><i class="c3" style="width:${w(r.sc.wins)}"></i><i class="c4" style="width:${w(r.sc.stats)}"></i></span></span>
         <span class="tot">${fmt(r.sc.total)}</span>
@@ -445,31 +478,33 @@ function tabBoard() {
   <button class="btn ghost" data-act="reload-lb">Refresh scores</button>`;
 }
 
+let boardLoading = false;
 async function loadBoard(force) {
+  if (boardLoading) return; boardLoading = true;
   try {
-    const [live, entries] = await Promise.all([getLive(force), api.entries(S.gid)]);
+    const [live, entries] = await Promise.all([getLive(force), api.allPicks()]);
     const rows = entries.map(e => ({ ...e, sc: scoreEntry(e, live.started ? live : null) })).sort((a, b) => b.sc.total - a.sc.total);
     S.lb = { live, rows }; S.lbErr = null;
   } catch (e) { console.error(e); S.lbErr = "Couldn't load the scores. Check your connection and try again."; }
+  boardLoading = false;
   render();
 }
 
 /* ---------- pick wizard ---------- */
-function blankDraft() { return { east: [], west: [], players: [] }; }
 function viewPick() {
   const d = S.draft, st = S.step;
   const titles = ['Eastern Conference', 'Western Conference', 'Your starting five', 'Lock it in'];
   const can = [d.east.length === 10, d.west.length === 10, d.players.length === 5, true][st];
-  let body = st < 2 ? stepConf(st === 0 ? 'east' : 'west') : st === 2 ? stepPlayers() : stepReview();
+  const body = st < 2 ? stepConf(st === 0 ? 'east' : 'west') : st === 2 ? stepPlayers() : stepReview();
   return `${topbar()}
   <main class="wrap stack" style="margin-top:16px;padding-bottom:0">
     <div class="steps" aria-hidden="true">${[0,1,2,3].map(i => `<div class="${i <= st ? 'on' : ''}"></div>`).join('')}</div>
-    <div><p class="eyebrow">Step ${st + 1} of 4 · ${esc(S.group.name)}</p><h2>${titles[st]}</h2></div>
+    <div><p class="eyebrow">Step ${st + 1} of 4 · ${esc(S.profile?.name || '')}</p><h2>${titles[st]}</h2></div>
     ${body}
     <div class="stepnav">
       <button class="btn" data-act="${st === 0 ? 'cancel-pick' : 'prev'}">${st === 0 ? 'Cancel' : '← Back'}</button>
       <span class="grow small muted">${[`${d.east.length}/10 teams`, `${d.west.length}/10 teams`, `${d.players.length}/5 players`, ''][st]}</span>
-      ${st < 3 ? `<button class="btn hot" data-act="next" ${can ? '' : 'disabled'}>Next →</button>` : `<button class="btn hot big" data-act="submit" ${S.busy ? 'disabled' : ''}>${S.busy ? 'Saving…' : S.entry ? 'Save changes' : 'Submit picks'}</button>`}
+      ${st < 3 ? `<button class="btn hot" data-act="next" ${can ? '' : 'disabled'}>Next →</button>` : `<button class="btn hot big" data-act="submit" ${S.busy ? 'disabled' : ''}>${S.busy ? 'Saving…' : S.picks ? 'Save changes' : 'Submit picks'}</button>`}
     </div>
   </main>`;
 }
@@ -535,25 +570,27 @@ function stepPlayers() {
 }
 
 function stepReview() {
-  return `<p class="muted">Look it over. You can come back and edit until tip-off.</p>${picksTables({ ...S.draft }, null)}`;
+  return `<p class="muted">Look it over. These picks count in every group you're in, including the ${esc(MAIN.name)}. You can edit until the end of October.</p>${picksTables({ ...S.draft }, null)}`;
 }
 
 /* ---------- render ---------- */
 function render() {
   const fns = { home: viewHome, join: viewJoin, group: viewGroup, pick: viewPick,
     loading: () => `${topbar()}<main class="wrap"><p class="muted center" style="margin-top:40px">Warming up…</p></main>`,
-    missing: () => `${topbar()}<main class="wrap stack" style="margin-top:24px"><section class="card stack"><h2>Group not found</h2><p>Check the link, or start your own group.</p><a class="btn hot" href="${location.pathname}">Create a group</a></section></main>`,
+    missing: () => `${topbar()}<main class="wrap stack" style="margin-top:24px"><section class="card stack"><h2>Group not found</h2><p>Check the link, or start your own group.</p><a class="btn hot" href="${location.pathname}">Go to Hoops Standings</a></section></main>`,
     error: () => `${topbar()}<main class="wrap stack" style="margin-top:24px"><section class="card stack"><h2>Something went wrong</h2><p>${esc(S.err)}</p><button class="btn" data-act="reload">Reload</button></section></main>` };
   $app.innerHTML = fns[S.view]();
   if (document.getElementById('calc-out')) calcUpdate();
 }
 
 /* ---------- navigation ---------- */
+function go(url) { history.pushState(null, '', url); }
+
 async function openGroup(gid) {
-  S.gid = gid; S.view = 'loading'; render();
+  S.gid = gid; S.view = 'loading'; S.lb = null; S.openUid = null; render();
   const g = await api.getGroup(gid);
   if (!g) { S.view = 'missing'; render(); return; }
-  S.group = g; rememberGroup(gid, g.name);
+  S.group = g;
   unsubMembers?.();
   let first = true;
   await new Promise(res => {
@@ -563,26 +600,40 @@ async function openGroup(gid) {
       else if (S.view === 'group' || S.view === 'join') render();
     });
   });
-  S.entry = await api.getEntry(gid);
-  if (me()) { S.view = 'group'; S.tab = isLocked() ? 'board' : 'squad'; }
-  else S.view = 'join';
+  if (S.profile) {
+    // Known player: opening any group link joins it (and the main group).
+    await Promise.all([api.joinGroup(gid), api.joinGroup(MAIN.id)]);
+    rememberGroup(gid, g.name);
+    S.view = 'group'; S.tab = isLocked() ? 'board' : 'squad';
+  } else S.view = 'join';
   render();
-  if (isLocked()) loadBoard();
 }
 
 function startPick() {
-  S.draft = store.get(draftKey()) || (S.entry ? { east: S.entry.east, west: S.entry.west, players: S.entry.players } : blankDraft());
+  if (isLocked()) { toast('Picks are locked for the season.'); return; }
+  S.back = S.view === 'group' ? 'group' : 'home';
+  S.draft = store.get(DRAFT) || (S.picks ? { east: S.picks.east, west: S.picks.west, players: S.picks.players } : { east: [], west: [], players: [] });
   S.step = 0; S.pq = ''; S.ppos = 'All'; S.view = 'pick'; render(); scrollTo(0, 0);
 }
 
 async function invite() {
   const url = inviteUrl();
-  const text = `Join "${S.group.name}" on Hoops Oracle: call the 2026-27 NBA standings and pick your starting five.`;
+  const text = `Join "${S.group.name}" on Hoops Standings: call the 2026-27 NBA standings and pick your starting five.`;
   if (navigator.share && /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent)) {
-    try { await navigator.share({ title: 'Hoops Oracle', text, url }); return; } catch (e) { if (e.name === 'AbortError') return; }
+    try { await navigator.share({ title: 'Hoops Standings', text, url }); return; } catch (e) { if (e.name === 'AbortError') return; }
   }
   try { await navigator.clipboard.writeText(url); toast('Invite link copied. Paste it in your group chat.'); }
-  catch { const el = document.getElementById('invite-url'); if (el) { el.select(); toast('Copy the highlighted link.'); } else { S.tab = 'squad'; render(); } }
+  catch { S.tab = 'squad'; render(); const el = document.getElementById('invite-url'); el?.select(); toast('Copy the highlighted link.'); }
+}
+
+async function ensureProfile(name) {
+  if (S.profile) return true;
+  name = (name || '').trim().slice(0, 30);
+  if (!name) return false;
+  await api.setProfile(name);
+  await api.joinGroup(MAIN.id);
+  S.profile = { name, done: false };
+  return true;
 }
 
 /* ---------- events ---------- */
@@ -606,15 +657,14 @@ $app.addEventListener('click', async e => {
   const { act, v, c } = b.dataset, i = +b.dataset.i;
   const d = S.draft;
   switch (act) {
-    case 'home': history.pushState(null, '', location.pathname); S.view = 'home'; S.err = ''; unsubMembers?.(); render(); break;
+    case 'home': go(location.pathname); unsubMembers?.(); S.view = 'home'; S.err = ''; render(); scrollTo(0, 0); break;
     case 'tab': S.tab = v; if (v === 'mine' && isLocked() && !S.lb) loadBoard(); render(); break;
     case 'invite': invite(); break;
     case 'pick': startPick(); break;
-    case 'spectate': S.view = 'group'; S.tab = 'board'; render(); break;
     case 'reload': location.reload(); break;
     case 'reload-lb': S.lb = null; S.lbErr = null; render(); loadBoard(true); break;
     case 'open': S.openUid = S.openUid === v ? null : v; render(); break;
-    case 'cancel-pick': S.view = 'group'; render(); break;
+    case 'cancel-pick': S.view = S.back || 'home'; render(); break;
     case 'prev': S.step--; render(); scrollTo(0, 0); break;
     case 'next': S.step++; render(); scrollTo(0, 0); break;
     case 'addteam': if (d[c].length < 10) { d[c].push({ a: v, w: teamBy[v].lw }); fixWinsDefault(c); saveDraft(); render(); } break;
@@ -633,7 +683,7 @@ $app.addEventListener('click', async e => {
     case 'submit': submit(); break;
   }
 });
-// New team defaults to last season's wins; keep the list from looking obviously out of order.
+// A new team defaults to last season's wins, capped so the list doesn't start out of order.
 function fixWinsDefault(c) { const l = S.draft[c]; const i = l.length - 1; if (i > 0 && l[i].w > l[i - 1].w) l[i].w = l[i - 1].w; }
 
 $app.addEventListener('input', e => {
@@ -650,54 +700,69 @@ $app.addEventListener('change', e => {
 $app.addEventListener('submit', async e => {
   e.preventDefault();
   if (S.busy) return;
+  const form = e.target.id;
+  const fail = msg => { S.busy = false; S.err = msg; S.errFor = form; render(); };
+  const val = id => document.getElementById(id)?.value.trim() || '';
+  const typed = val('sname') || val('jname') || val('myname');
   try {
-    if (e.target.id === 'create') {
-      const name = document.getElementById('gname').value.trim(), my = document.getElementById('myname').value.trim();
-      if (!name || !my) { S.err = 'Add a group name and your name.'; render(); return; }
+    if (form === 'start') {
+      S.busy = true; render();
+      if (!(await ensureProfile(typed))) return fail('Add your name.');
+      S.busy = false; S.err = ''; startPick();
+    } else if (form === 'create') {
+      const name = val('gname').slice(0, 40);
+      if (!name) return fail('Give your group a name.');
+      if (!S.profile && !typed) return fail('Add your name.');
       S.busy = true; S.err = ''; render();
-      const id = await api.createGroup(name.slice(0, 40), my.slice(0, 30));
-      store.set('ho-name', my);
+      await ensureProfile(typed);
+      const id = await api.createGroup(name);
       S.busy = false;
-      history.pushState(null, '', `?g=${id}`);
+      go(`?g=${id}`);
       await openGroup(id);
-      toast('Group created! Invite your friends, then make your picks.');
-    } else if (e.target.id === 'join') {
-      const my = document.getElementById('jname').value.trim();
-      if (!my) { S.err = 'Add your name.'; render(); return; }
+      toast('Group created! Send the invite link to your friends.');
+    } else if (form === 'join') {
       S.busy = true; S.err = ''; render();
-      await api.join(S.gid, my.slice(0, 30)); store.set('ho-name', my);
+      if (!(await ensureProfile(typed))) return fail('Add your name.');
+      await api.joinGroup(S.gid); rememberGroup(S.gid, S.group.name);
       S.busy = false;
-      if (!me()) S.members.push({ uid: api.uid, name: my, done: false });
-      startPick();
+      if (!S.members.some(m => m.uid === api.uid)) S.members.push({ uid: api.uid, name: S.profile.name, done: false });
+      S.view = 'group'; S.tab = isLocked() ? 'board' : 'squad';
+      if (isLocked()) render(); else startPick();
     }
-  } catch (err) { console.error(err); S.busy = false; S.err = 'That didn\'t work. Check your connection and try again.'; render(); }
+  } catch (err) { console.error(err); fail('That didn\'t work. Check your connection and try again.'); }
 });
 
 async function submit() {
-  if (isLocked()) { toast('Picks are locked. The season has started.'); return; }
+  if (isLocked()) { toast('Picks are locked for the season.'); return; }
   const d = S.draft;
   if (d.east.length !== 10 || d.west.length !== 10 || d.players.length !== 5) { toast('Finish all three steps first.'); return; }
   S.busy = true; render();
   try {
-    const entry = { name: me()?.name || store.get('ho-name', 'Player'), east: d.east, west: d.west, players: d.players, updatedAt: Date.now() };
-    await api.saveEntry(S.gid, entry);
-    S.entry = entry; store.del(draftKey());
-    S.busy = false; S.view = 'group'; S.tab = 'mine'; render(); scrollTo(0, 0);
-    confetti(); toast('Picks locked in. See you at tip-off! 🏀');
+    const p = { east: d.east, west: d.west, players: d.players, updatedAt: Date.now() };
+    await api.savePicks(p);
+    S.picks = p; S.profile = { ...S.profile, done: true }; store.del(DRAFT);
+    S.busy = false;
+    if (S.back === 'group' && S.group) { S.view = 'group'; S.tab = 'mine'; }
+    else { go(`?g=${MAIN.id}`); await openGroup(MAIN.id); S.tab = 'mine'; }
+    render(); scrollTo(0, 0);
+    confetti(); toast('Picks are in. They count in all your groups. 🏀');
   } catch (err) { console.error(err); S.busy = false; render(); toast('Could not save. Check your connection and try again.'); }
 }
 
-addEventListener('popstate', () => boot());
+addEventListener('popstate', () => route());
 
 /* ---------- boot ---------- */
-async function boot() {
-  if (!api) {
-    try { api = window.FIREBASE_CONFIG ? await firebaseApi(window.FIREBASE_CONFIG) : localApi(); }
-    catch (e) { console.error(e); S.err = 'Could not connect to the game server. Check your connection and reload.'; S.view = 'error'; render(); return; }
-  }
+async function route() {
   const gid = new URLSearchParams(location.search).get('g');
   if (gid) await openGroup(gid.replace(/[^a-z0-9]/gi, '').slice(0, 20));
-  else { S.view = 'home'; render(); }
+  else { unsubMembers?.(); S.view = 'home'; render(); }
+}
+async function boot() {
+  try {
+    api = window.FIREBASE_CONFIG ? await firebaseApi(window.FIREBASE_CONFIG) : localApi();
+    [S.profile, S.picks] = await Promise.all([api.getProfile(), api.getPicks()]);
+  } catch (e) { console.error(e); S.err = 'Could not connect to the game server. Check your connection and reload.'; S.view = 'error'; render(); return; }
+  await route();
 }
 render();
 boot();

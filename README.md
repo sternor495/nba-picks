@@ -1,4 +1,4 @@
-# Hoops Oracle
+# Hoops Standings
 
 Predict the 2026-27 NBA season with friends: conference top 10s, win totals, and a starting five's stat lines. Static site (GitHub Pages) + Firebase Firestore. Live scoring pulls from ESPN's public feeds.
 

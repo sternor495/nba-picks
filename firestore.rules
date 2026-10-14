@@ -1,32 +1,38 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Picks lock at the 2026-27 opening tip (keep in sync with LOCK_AT in config.js).
-    function locked() { return request.time > timestamp.value(1792537200000); }
+    // Picks lock at the end of October (keep in sync with LOCK_AT in config.js).
+    function locked() { return request.time > timestamp.value(1793505540000); }
     function signedIn() { return request.auth != null; }
     function okName(n) { return n is string && n.size() > 0 && n.size() <= 30; }
 
+    // Public profile: name + whether picks are in.
+    match /profiles/{uid} {
+      allow read: if signedIn();
+      allow create, update: if request.auth.uid == uid && okName(request.resource.data.name);
+    }
+
+    // One set of picks per person, used in every group. Secret until lock.
+    match /picks/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || locked());
+      allow create, update: if request.auth.uid == uid && !locked()
+        && request.resource.data.east.size() == 10
+        && request.resource.data.west.size() == 10
+        && request.resource.data.players.size() == 5;
+    }
+
     match /groups/{g} {
       allow get: if signedIn();
-      allow create: if signedIn()
-        && request.resource.data.owner == request.auth.uid
-        && request.resource.data.name is string
-        && request.resource.data.name.size() > 0
-        && request.resource.data.name.size() <= 40;
+      allow create: if signedIn() && (
+        (g == 'main' && request.resource.data.name == 'Top 10 Main Group')
+        || (g != 'main' && request.resource.data.owner == request.auth.uid
+            && request.resource.data.name is string
+            && request.resource.data.name.size() > 0
+            && request.resource.data.name.size() <= 40));
 
-      // Public roster: names + whether picks are in.
       match /members/{uid} {
         allow read: if signedIn();
-        allow create, update: if request.auth.uid == uid && !locked() && okName(request.resource.data.name);
-      }
-
-      // Picks stay secret until tip-off, then everyone in the group can see them.
-      match /entries/{uid} {
-        allow read: if signedIn() && (request.auth.uid == uid || locked());
-        allow create, update: if request.auth.uid == uid && !locked()
-          && request.resource.data.east.size() == 10
-          && request.resource.data.west.size() == 10
-          && request.resource.data.players.size() == 5;
+        allow create: if request.auth.uid == uid;
       }
     }
   }
