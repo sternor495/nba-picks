@@ -368,7 +368,7 @@ function nameField(id) {
   if (S.profile) return '';
   return `<div class="calc" style="grid-template-columns:2fr 1fr">
     <div><label class="lbl" for="${id}">Your name</label><input class="txt" id="${id}" maxlength="30" placeholder="What friends call you" autocomplete="off" required></div>
-    <div><label class="lbl" for="${id}-pin">4-digit code</label><input class="txt num" id="${id}-pin" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" placeholder="••••" autocomplete="off" required></div>
+    <div><label class="lbl" for="${id}-pin">Your 4-digit code</label><input class="txt num" id="${id}-pin" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" placeholder="••••" autocomplete="off" required></div>
   </div><p class="muted small" style="margin-top:-8px">Pick a code you'll remember. It's how you get back in on another phone or computer.</p>`;
 }
 
