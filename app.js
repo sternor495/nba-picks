@@ -94,30 +94,48 @@ async function getLive(force) {
 }
 
 /* ---------- backends ----------
-   Data model: profiles/{uid} {name, done} · picks/{uid} {east, west, players} · groups/{id} {name, owner} · groups/{id}/members/{uid} */
+   Data model:
+   players/{pid} {name, nameLower, done}   public card
+   pins/{pid} {pin}                        never readable
+   sessions/{uid} {pid, pin}               this browser is signed in as pid (rules check the pin)
+   picks/{pid} {east, west, players}       secret until lock
+   groups/{id} {name, owner} · groups/{id}/members/{pid} */
+class BadPin extends Error {}
+class NameTaken extends Error {}
+const lower = s => s.trim().toLowerCase();
+
 function localApi() {
   const KEY = 'hs-localdb';
-  const load = () => store.get(KEY, { profiles: {}, picks: {}, groups: {} });
+  const load = () => store.get(KEY, { players: {}, pins: {}, picks: {}, groups: {} });
   const save = db => store.set(KEY, db);
-  let uid = store.get('hs-uid'); if (!uid) { uid = randId(12); store.set('hs-uid', uid); }
+  let pid = store.get('hs-session', null);
   const listeners = new Set();
   const ping = () => listeners.forEach(f => f());
   const ensure = (db, id, name, owner) => { db.groups[id] = db.groups[id] || { name, owner, members: {} }; return db.groups[id]; };
   return {
-    mode: 'local', uid,
-    async getProfile() { return load().profiles[uid] || null; },
-    async setProfile(name) { const db = load(); db.profiles[uid] = { done: false, ...db.profiles[uid], name }; save(db); ping(); },
-    async createGroup(name) { const db = load(), id = randId(8); ensure(db, id, name, uid).members[uid] = Date.now(); save(db); return id; },
+    mode: 'local',
+    get pid() { return pid; },
+    async me() { const p = pid && load().players[pid]; return p ? { pid, ...p } : null; },
+    async register(name, pin) {
+      const db = load();
+      if (Object.values(db.players).some(p => p.nameLower === lower(name))) throw new NameTaken();
+      pid = randId(10); db.pins[pid] = pin; db.players[pid] = { name, nameLower: lower(name), done: false };
+      ensure(db, MAIN.id, MAIN.name, 'system').members[pid] = Date.now();
+      save(db); store.set('hs-session', pid); return this.me();
+    },
+    async login(id, pin) { if (load().pins[id] !== pin) throw new BadPin(); pid = id; store.set('hs-session', pid); return this.me(); },
+    async logout() { pid = null; store.del('hs-session'); },
+    async search(q) { q = lower(q); return Object.entries(load().players).filter(([, p]) => p.nameLower.startsWith(q)).slice(0, 10).map(([id, p]) => ({ pid: id, name: p.name })); },
+    async createGroup(name) { const db = load(), id = randId(8); ensure(db, id, name, pid).members[pid] = Date.now(); save(db); return id; },
     async getGroup(id) { const db = load(); if (isMain(id)) { ensure(db, id, MAIN.name, 'system'); save(db); } const g = db.groups[id]; return g ? { id, name: g.name, owner: g.owner } : null; },
-    async joinGroup(id) { const db = load(); const g = isMain(id) ? ensure(db, id, MAIN.name, 'system') : db.groups[id]; if (g && !g.members[uid]) { g.members[uid] = Date.now(); save(db); ping(); } },
-    async myGroupIds() { const db = load(); return Object.entries(db.groups).filter(([, g]) => g.members[uid]).map(([id, g]) => ({ id, name: g.name })); },
+    async joinGroup(id) { const db = load(); const g = isMain(id) ? ensure(db, id, MAIN.name, 'system') : db.groups[id]; if (g && pid && !g.members[pid]) { g.members[pid] = Date.now(); save(db); ping(); } },
     watchMembers(id, cb) {
-      const f = () => { const db = load(); const g = db.groups[id]; cb(Object.entries(g?.members || {}).map(([u, t]) => ({ uid: u, joinedAt: t, ...(db.profiles[u] || { name: '?', done: false }) }))); };
+      const f = () => { const db = load(); const g = db.groups[id]; cb(Object.entries(g?.members || {}).map(([u, t]) => ({ uid: u, joinedAt: t, ...(db.players[u] || { name: '?', done: false }) }))); };
       listeners.add(f); f(); return () => listeners.delete(f);
     },
-    async getPicks() { return load().picks[uid] || null; },
-    async savePicks(p) { if (isLocked()) throw new Error('locked'); const db = load(); db.picks[uid] = p; db.profiles[uid] = { ...db.profiles[uid], done: true }; save(db); ping(); },
-    async allPicks() { const db = load(); return Object.entries(db.picks).filter(([u]) => isLocked() || u === uid).map(([u, e]) => ({ uid: u, ...e, name: db.profiles[u]?.name || '?' })); },
+    async getPicks() { return (pid && load().picks[pid]) || null; },
+    async savePicks(p) { if (isLocked()) throw new Error('locked'); const db = load(); db.picks[pid] = p; db.players[pid].done = true; save(db); ping(); },
+    async allPicks() { const db = load(); return Object.entries(db.picks).filter(([u]) => isLocked() || u === pid).map(([u, e]) => ({ uid: u, ...e, name: db.players[u]?.name || '?' })); },
   };
 }
 
@@ -135,17 +153,42 @@ async function firebaseApi(cfg) {
   const uid = user.uid;
   const G = id => db.collection('groups').doc(id);
   const now = firebase.firestore.FieldValue.serverTimestamp;
-  // Profiles are shared by every group view; keep one live subscription.
-  let profiles = {}; const profSubs = new Set();
-  db.collection('profiles').onSnapshot(q => { profiles = Object.fromEntries(q.docs.map(d => [d.id, d.data()])); profSubs.forEach(f => f()); }, e => console.error(e));
-  return {
-    mode: 'cloud', uid,
-    async getProfile() { const s = await db.collection('profiles').doc(uid).get(); return s.exists ? s.data() : null; },
-    async setProfile(name) { const ref = db.collection('profiles').doc(uid); const s = await ref.get(); await ref.set(s.exists ? { name } : { name, done: false }, { merge: true }); },
+  const sessionRef = db.collection('sessions').doc(uid);
+  let pid = null;
+  try { const s = await sessionRef.get(); pid = s.exists ? s.data().pid : null; } catch (e) { console.error(e); }
+  // Player cards are shared by every group view; keep one live subscription.
+  let players = {}; const subs = new Set();
+  db.collection('players').onSnapshot(q => { players = Object.fromEntries(q.docs.map(d => [d.id, d.data()])); subs.forEach(f => f()); }, e => console.error(e));
+  const claim = async (id, pin) => {
+    try { await sessionRef.set({ pid: id, pin }); }
+    catch (e) { if (e.code === 'permission-denied') throw new BadPin(); throw e; }
+    pid = id;
+  };
+  const api = {
+    mode: 'cloud',
+    get pid() { return pid; },
+    async me() { if (!pid) return null; const s = await db.collection('players').doc(pid).get(); return s.exists ? { pid, ...s.data() } : null; },
+    async register(name, pin) {
+      const taken = await db.collection('players').where('nameLower', '==', lower(name)).limit(1).get();
+      if (!taken.empty) throw new NameTaken();
+      const id = randId(10);
+      await db.collection('pins').doc(id).set({ pin });
+      await claim(id, pin);
+      await db.collection('players').doc(id).set({ name, nameLower: lower(name), done: false, joinedAt: now() });
+      await api.joinGroup(MAIN.id);
+      return api.me();
+    },
+    async login(id, pin) { await claim(id, pin); return api.me(); },
+    async logout() { await sessionRef.delete(); pid = null; },
+    async search(q) {
+      q = lower(q); if (!q) return [];
+      const r = await db.collection('players').where('nameLower', '>=', q).where('nameLower', '<=', q + '').limit(10).get();
+      return r.docs.map(d => ({ pid: d.id, name: d.data().name }));
+    },
     async createGroup(name) {
       const id = randId(8);
-      await G(id).set({ name, owner: uid, createdAt: now() });
-      await G(id).collection('members').doc(uid).set({ joinedAt: now() });
+      await G(id).set({ name, owner: pid, createdAt: now() });
+      await G(id).collection('members').doc(pid).set({ joinedAt: now() });
       return id;
     },
     async getGroup(id) {
@@ -154,28 +197,29 @@ async function firebaseApi(cfg) {
       return s.exists ? { id, ...s.data() } : null;
     },
     async joinGroup(id) {
-      const ref = G(id).collection('members').doc(uid);
-      if (!(await ref.get()).exists) await ref.set({ joinedAt: now() });
+      if (!pid) return;
+      const ref = G(id).collection('members').doc(pid);
+      if (!(await ref.get()).exists) { if (isMain(id)) await api.getGroup(id); await ref.set({ joinedAt: now() }); }
     },
-    async myGroupIds() { return null; },
     watchMembers(id, cb) {
       let members = [];
-      const emit = () => cb(members.map(m => ({ ...m, ...(profiles[m.uid] || { name: '…', done: false }) })));
-      profSubs.add(emit);
+      const emit = () => cb(members.map(m => ({ ...m, ...(players[m.uid] || { name: '…', done: false }) })));
+      subs.add(emit);
       const off = G(id).collection('members').onSnapshot(q => { members = q.docs.map(d => ({ uid: d.id, joinedAt: d.data().joinedAt?.toMillis?.() || Date.now() })); emit(); }, e => console.error(e));
-      return () => { off(); profSubs.delete(emit); };
+      return () => { off(); subs.delete(emit); };
     },
-    async getPicks() { const s = await db.collection('picks').doc(uid).get(); return s.exists ? s.data() : null; },
+    async getPicks() { if (!pid) return null; const s = await db.collection('picks').doc(pid).get(); return s.exists ? s.data() : null; },
     async savePicks(p) {
-      await db.collection('picks').doc(uid).set({ ...p, savedAt: now() });
-      await db.collection('profiles').doc(uid).set({ done: true }, { merge: true });
+      await db.collection('picks').doc(pid).set({ ...p, savedAt: now() });
+      await db.collection('players').doc(pid).set({ done: true }, { merge: true });
     },
     async allPicks() {
-      if (!isLocked()) { const e = await this.getPicks(); return e ? [{ uid, ...e, name: profiles[uid]?.name }] : []; }
+      if (!isLocked()) { const e = await api.getPicks(); return e ? [{ uid: pid, ...e, name: players[pid]?.name }] : []; }
       const q = await db.collection('picks').get();
-      return q.docs.map(d => ({ uid: d.id, ...d.data(), name: profiles[d.id]?.name || '?' }));
+      return q.docs.map(d => ({ uid: d.id, ...d.data(), name: players[d.id]?.name || '?' }));
     },
   };
+  return api;
 }
 
 /* ---------- state ---------- */
@@ -187,6 +231,7 @@ const S = {
   tab: 'board', step: 0, draft: null, back: null,
   pq: '', ppos: 'All', openUid: null,
   lb: null, lbErr: null, err: '', busy: false,
+  login: { q: '', results: [], sel: null, err: '' },
 };
 let unsubMembers = null;
 
@@ -217,7 +262,7 @@ setInterval(() => { document.querySelectorAll('[data-clock]').forEach(el => { el
 function topbar() {
   return `<header class="top"><div class="in">
     <button class="brand" data-act="home" aria-label="Hoops Standings home">${BALL}Hoops Standings</button>
-    <span class="sp"></span>${countdown(true)}
+    <span class="sp"></span>${S.profile ? `<button class="pill" style="border:0" data-act="logout" title="Switch player">${esc(S.profile.name)} · switch</button>` : countdown(true)}
   </div></header>${api?.mode === 'local' ? `<div class="demo">Demo mode: picks are saved in this browser only.</div>` : ''}`;
 }
 
@@ -321,7 +366,32 @@ function calcUpdate() {
 
 /* ---------- views ---------- */
 function nameField(id) {
-  return S.profile ? '' : `<div><label class="lbl" for="${id}">Your name</label><input class="txt" id="${id}" maxlength="30" placeholder="What your friends call you" required></div>`;
+  if (S.profile) return '';
+  return `<div class="calc" style="grid-template-columns:2fr 1fr">
+    <div><label class="lbl" for="${id}">Your name</label><input class="txt" id="${id}" maxlength="30" placeholder="What friends call you" autocomplete="off" required></div>
+    <div><label class="lbl" for="${id}-pin">4-digit code</label><input class="txt num" id="${id}-pin" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" placeholder="••••" autocomplete="off" required></div>
+  </div><p class="muted small" style="margin-top:-8px">Pick a code you'll remember. It's how you get back in on another phone or computer.</p>`;
+}
+
+function loginCard() {
+  if (S.profile) return '';
+  const L = S.login;
+  return `<section class="card stack">
+    <div><p class="eyebrow">Already playing?</p><h3>Log in with your code</h3></div>
+    ${L.sel ? `<form id="login" class="stack" autocomplete="off">
+        <div class="row">${avatar(L.sel.name)}<b class="grow">${esc(L.sel.name)}</b><button type="button" class="btn ghost" data-act="lclear">Not you?</button></div>
+        <div><label class="lbl" for="lpin">Your 4-digit code</label><input class="txt num" id="lpin" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" placeholder="••••" autocomplete="off" required></div>
+        ${L.err ? `<p class="err">${esc(L.err)}</p>` : ''}
+        <button class="btn hot" ${S.busy ? 'disabled' : ''}>Log in</button>
+      </form>` : `<div><label class="lbl" for="lq">Find your name</label><input class="txt" id="lq" type="search" placeholder="Start typing your name" value="${esc(L.q)}" autocomplete="off"></div>
+      <div class="stack" style="gap:6px" id="lresults">${loginResults()}</div>`}
+  </section>`;
+}
+function loginResults() {
+  const L = S.login;
+  if (!L.q.trim()) return '';
+  if (!L.results.length) return '<p class="muted small">No players with that name yet.</p>';
+  return L.results.map(r => `<button class="btn" style="justify-content:flex-start" data-act="lpick" data-v="${esc(r.pid)}" data-n="${esc(r.name)}">${avatar(r.name)} ${esc(r.name)}</button>`).join('');
 }
 
 function viewHome() {
@@ -344,6 +414,7 @@ function viewHome() {
         ${S.err && S.errFor === 'start' ? `<p class="err">${esc(S.err)}</p>` : ''}
         <button class="btn hot big" ${S.busy ? 'disabled' : ''}>Make my picks</button></form>
     </section>` : `<section class="card stack"><div class="row"><div class="grow"><p class="eyebrow">Playing as</p><h3>${esc(p.name)}</h3></div>${p.done ? '<span class="badge ok">Picks in ✓</span>' : '<span class="badge wait">Picks not in yet</span>'}</div></section>`}
+    ${loginCard()}
     <section class="card stack"><h3>Your groups</h3><div class="stack" style="gap:8px">${gs.map(g => `<a class="btn" style="justify-content:space-between" href="?g=${esc(g.id)}"><span>${isMain(g.id) ? '🏆 ' : ''}${esc(g.name)}</span><span aria-hidden="true">→</span></a>`).join('')}</div></section>
     <section class="card stack">
       <div><p class="eyebrow">For your crew</p><h2>Create a group</h2></div>
@@ -372,11 +443,12 @@ function viewJoin() {
       <h2>Join the group</h2>
       ${isLocked() ? `<p class="muted">Picks are locked for the season, so you can follow along but not play.</p>` : `<p class="muted">You'll also be in the ${esc(MAIN.name)} with everyone else.</p>`}
       <form id="join" class="stack" autocomplete="off">
-        <div><label class="lbl" for="jname">What should we call you?</label><input class="txt" id="jname" maxlength="30" placeholder="Your name" required></div>
+        ${nameField('jname')}
         ${S.err ? `<p class="err">${esc(S.err)}</p>` : ''}
         <button class="btn hot big" ${S.busy ? 'disabled' : ''}>${isLocked() ? 'Join to follow' : 'Join & make my picks'}</button>
       </form>
     </section>
+    ${loginCard()}
     ${rulesHtml()}
   </main>`;
 }
@@ -408,7 +480,7 @@ function tabSquad() {
   </section>
   <section class="card">
     <h3 style="margin-bottom:6px">Players</h3>
-    ${ms.map(m => `<div class="mem">${avatar(m.name)}<div class="grow"><b>${esc(m.name)}</b>${m.uid === S.group.owner ? ' <span class="muted small">· started the group</span>' : ''}${m.uid === api.uid ? ' <span class="muted small">· you</span>' : ''}</div>${m.done ? '<span class="badge ok">Picks in ✓</span>' : '<span class="badge wait">Thinking…</span>'}</div>`).join('') || '<p class="muted">No one yet.</p>'}
+    ${ms.map(m => `<div class="mem">${avatar(m.name)}<div class="grow"><b>${esc(m.name)}</b>${m.uid === S.group.owner ? ' <span class="muted small">· started the group</span>' : ''}${m.uid === api.pid ? ' <span class="muted small">· you</span>' : ''}</div>${m.done ? '<span class="badge ok">Picks in ✓</span>' : '<span class="badge wait">Thinking…</span>'}</div>`).join('') || '<p class="muted">No one yet.</p>'}
   </section>`;
 }
 
@@ -470,7 +542,7 @@ function tabBoard() {
       const crown = rank === 1 && live.started;
       return `<button class="lbrow ${crown ? 'first' : ''}" data-act="open" data-v="${esc(r.uid)}" aria-expanded="${open}">
         <span class="pos">${crown ? '👑' : rank}</span>
-        <span class="grow" style="min-width:0"><b>${esc(r.name)}</b>${r.uid === api.uid ? ' <span class="muted small">· you</span>' : ''}
+        <span class="grow" style="min-width:0"><b>${esc(r.name)}</b>${r.uid === api.pid ? ' <span class="muted small">· you</span>' : ''}
           <span class="bars"><i class="c1" style="width:${w(r.sc.eastPlace)}"></i><i class="c2" style="width:${w(r.sc.westPlace)}"></i><i class="c3" style="width:${w(r.sc.wins)}"></i><i class="c4" style="width:${w(r.sc.stats)}"></i></span></span>
         <span class="tot">${fmt(r.sc.total)}</span>
       </button>${open ? `<div style="padding:4px 0 12px">${picksTables(r, live.started ? r.sc : null)}</div>` : ''}`;
@@ -626,13 +698,14 @@ async function invite() {
   catch { S.tab = 'squad'; render(); const el = document.getElementById('invite-url'); el?.select(); toast('Copy the highlighted link.'); }
 }
 
-async function ensureProfile(name) {
+async function ensureProfile(name, pin) {
   if (S.profile) return true;
   name = (name || '').trim().slice(0, 30);
-  if (!name) return false;
-  await api.setProfile(name);
-  await api.joinGroup(MAIN.id);
-  S.profile = { name, done: false };
+  if (!name) throw new Error('Add your name.');
+  if (!/^[0-9]{4}$/.test(pin || '')) throw new Error('Pick a 4-digit code (numbers only).');
+  try { S.profile = await api.register(name, pin); }
+  catch (e) { if (e instanceof NameTaken) throw new Error(`"${name}" is already playing. If that's you, log in with your code below. Otherwise add a last initial.`); throw e; }
+  S.picks = null;
   return true;
 }
 
@@ -681,13 +754,22 @@ $app.addEventListener('click', async e => {
     }
     case 'rmplayer': d.players = d.players.filter(p => p.id !== v); saveDraft(); render(); break;
     case 'submit': submit(); break;
+    case 'lpick': S.login.sel = { pid: v, name: b.dataset.n }; S.login.err = ''; render(); document.getElementById('lpin')?.focus(); break;
+    case 'lclear': S.login.sel = null; render(); break;
+    case 'logout': await api.logout(); S.profile = null; S.picks = null; store.del(DRAFT); go(location.pathname); unsubMembers?.(); S.view = 'home'; render(); toast('Signed out. Log in with your name and code.'); break;
   }
 });
 // A new team defaults to last season's wins, capped so the list doesn't start out of order.
 function fixWinsDefault(c) { const l = S.draft[c]; const i = l.length - 1; if (i > 0 && l[i].w > l[i - 1].w) l[i].w = l[i - 1].w; }
 
+let lqT;
 $app.addEventListener('input', e => {
   const t = e.target;
+  if (t.id === 'lq') {
+    S.login.q = t.value; clearTimeout(lqT);
+    lqT = setTimeout(async () => { const q = S.login.q; const r = q.trim() ? await api.search(q).catch(() => []) : []; if (q !== S.login.q) return; S.login.results = r; const el = document.getElementById('lresults'); if (el) el.innerHTML = loginResults(); }, 250);
+    return;
+  }
   if (t.id === 'psearch') { S.pq = t.value; document.getElementById('plist').innerHTML = playerListHtml(); return; }
   if (t.dataset.num) { if (t.value !== '') setNum(t.dataset, t.value); return; }
   if (/^c[wp]-/.test(t.id)) calcUpdate();
@@ -704,17 +786,17 @@ $app.addEventListener('submit', async e => {
   const fail = msg => { S.busy = false; S.err = msg; S.errFor = form; render(); };
   const val = id => document.getElementById(id)?.value.trim() || '';
   const typed = val('sname') || val('jname') || val('myname');
+  const pin = val('sname-pin') || val('jname-pin') || val('myname-pin');
   try {
     if (form === 'start') {
       S.busy = true; render();
-      if (!(await ensureProfile(typed))) return fail('Add your name.');
+      await ensureProfile(typed, pin);
       S.busy = false; S.err = ''; startPick();
     } else if (form === 'create') {
       const name = val('gname').slice(0, 40);
       if (!name) return fail('Give your group a name.');
-      if (!S.profile && !typed) return fail('Add your name.');
       S.busy = true; S.err = ''; render();
-      await ensureProfile(typed);
+      await ensureProfile(typed, pin);
       const id = await api.createGroup(name);
       S.busy = false;
       go(`?g=${id}`);
@@ -722,14 +804,23 @@ $app.addEventListener('submit', async e => {
       toast('Group created! Send the invite link to your friends.');
     } else if (form === 'join') {
       S.busy = true; S.err = ''; render();
-      if (!(await ensureProfile(typed))) return fail('Add your name.');
+      await ensureProfile(typed, pin);
       await api.joinGroup(S.gid); rememberGroup(S.gid, S.group.name);
       S.busy = false;
-      if (!S.members.some(m => m.uid === api.uid)) S.members.push({ uid: api.uid, name: S.profile.name, done: false });
+      if (!S.members.some(m => m.uid === api.pid)) S.members.push({ uid: api.pid, name: S.profile.name, done: false });
       S.view = 'group'; S.tab = isLocked() ? 'board' : 'squad';
       if (isLocked()) render(); else startPick();
+    } else if (form === 'login') {
+      const code = val('lpin');
+      S.busy = true; S.login.err = ''; render();
+      try { S.profile = await api.login(S.login.sel.pid, code); }
+      catch (e2) { S.busy = false; S.login.err = e2 instanceof BadPin ? 'Wrong code. Try again.' : 'That didn\'t work. Check your connection.'; render(); return; }
+      S.picks = await api.getPicks(); S.busy = false; S.login = { q: '', results: [], sel: null, err: '' };
+      store.del(DRAFT);
+      toast(`Welcome back, ${S.profile.name}!`);
+      await route();
     }
-  } catch (err) { console.error(err); fail('That didn\'t work. Check your connection and try again.'); }
+  } catch (err) { console.error(err); fail(err.message && !/network|fetch|permission/i.test(err.message) ? err.message : 'That didn\'t work. Check your connection and try again.'); }
 });
 
 async function submit() {
@@ -760,7 +851,7 @@ async function route() {
 async function boot() {
   try {
     api = window.FIREBASE_CONFIG ? await firebaseApi(window.FIREBASE_CONFIG) : localApi();
-    [S.profile, S.picks] = await Promise.all([api.getProfile(), api.getPicks()]);
+    [S.profile, S.picks] = await Promise.all([api.me(), api.getPicks()]);
   } catch (e) { console.error(e); S.err = 'Could not connect to the game server. Check your connection and reload.'; S.view = 'error'; render(); return; }
   await route();
 }

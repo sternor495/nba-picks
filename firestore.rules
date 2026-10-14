@@ -5,17 +5,34 @@ service cloud.firestore {
     function locked() { return request.time > timestamp.value(1793505540000); }
     function signedIn() { return request.auth != null; }
     function okName(n) { return n is string && n.size() > 0 && n.size() <= 30; }
+    // Each browser signs in anonymously; sessions/{uid} says which player it is,
+    // and was only allowed after the right 4-digit code was given.
+    function session() { return /databases/$(database)/documents/sessions/$(request.auth.uid); }
+    function isPlayer(pid) { return signedIn() && exists(session()) && get(session()).data.pid == pid; }
 
-    // Public profile: name + whether picks are in.
-    match /profiles/{uid} {
-      allow read: if signedIn();
-      allow create, update: if request.auth.uid == uid && okName(request.resource.data.name);
+    // Secret codes: write-once, never readable by anyone.
+    match /pins/{pid} {
+      allow read: if false;
+      allow create: if signedIn() && request.resource.data.pin.matches('^[0-9]{4}$');
     }
 
-    // One set of picks per person, used in every group. Secret until lock.
-    match /picks/{uid} {
-      allow read: if signedIn() && (request.auth.uid == uid || locked());
-      allow create, update: if request.auth.uid == uid && !locked()
+    // A browser claims a player by presenting that player's code.
+    match /sessions/{uid} {
+      allow read, delete: if signedIn() && request.auth.uid == uid;
+      allow create, update: if signedIn() && request.auth.uid == uid
+        && request.resource.data.pin == get(/databases/$(database)/documents/pins/$(request.resource.data.pid)).data.pin;
+    }
+
+    // Public player card: name + whether picks are in.
+    match /players/{pid} {
+      allow read: if signedIn();
+      allow create, update: if isPlayer(pid) && okName(request.resource.data.name);
+    }
+
+    // One set of picks per player, used in every group. Secret until lock.
+    match /picks/{pid} {
+      allow read: if isPlayer(pid) || (signedIn() && locked());
+      allow create, update: if isPlayer(pid) && !locked()
         && request.resource.data.east.size() == 10
         && request.resource.data.west.size() == 10
         && request.resource.data.players.size() == 5;
@@ -25,14 +42,14 @@ service cloud.firestore {
       allow get: if signedIn();
       allow create: if signedIn() && (
         (g == 'main' && request.resource.data.name == 'Top 10 Main Group')
-        || (g != 'main' && request.resource.data.owner == request.auth.uid
+        || (g != 'main' && isPlayer(request.resource.data.owner)
             && request.resource.data.name is string
             && request.resource.data.name.size() > 0
             && request.resource.data.name.size() <= 40));
 
-      match /members/{uid} {
+      match /members/{pid} {
         allow read: if signedIn();
-        allow create: if request.auth.uid == uid;
+        allow create: if isPlayer(pid);
       }
     }
   }
