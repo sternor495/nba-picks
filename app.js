@@ -126,7 +126,7 @@ function localApi() {
     async login(id, pin) { if (load().pins[id] !== pin) throw new BadPin(); pid = id; store.set('hs-session', pid); return this.me(); },
     async logout() { pid = null; store.del('hs-session'); },
     async search(q) { q = lower(q); return Object.entries(load().players).filter(([, p]) => p.nameLower.startsWith(q)).slice(0, 10).map(([id, p]) => ({ pid: id, name: p.name })); },
-    async createGroup(name) { const db = load(), id = randId(8); ensure(db, id, name, pid).members[pid] = Date.now(); save(db); return id; },
+    async createGroup(name, id = randId(8)) { const db = load(); ensure(db, id, name, pid).members[pid] = Date.now(); save(db); return id; },
     async getGroup(id) { const db = load(); if (isMain(id)) { ensure(db, id, MAIN.name, 'system'); save(db); } const g = db.groups[id]; return g ? { id, name: g.name, owner: g.owner } : null; },
     async joinGroup(id) { const db = load(); const g = isMain(id) ? ensure(db, id, MAIN.name, 'system') : db.groups[id]; if (g && pid && !g.members[pid]) { g.members[pid] = Date.now(); save(db); ping(); } },
     watchMembers(id, cb) {
@@ -185,8 +185,7 @@ async function firebaseApi(cfg) {
       const r = await db.collection('players').where('nameLower', '>=', q).where('nameLower', '<=', q + '').limit(10).get();
       return r.docs.map(d => ({ pid: d.id, name: d.data().name }));
     },
-    async createGroup(name) {
-      const id = randId(8);
+    async createGroup(name, id = randId(8)) {
       await G(id).set({ name, owner: pid, createdAt: now() });
       await G(id).collection('members').doc(pid).set({ joinedAt: now() });
       return id;
@@ -649,13 +648,26 @@ function stepReview() {
 function render() {
   const fns = { home: viewHome, join: viewJoin, group: viewGroup, pick: viewPick,
     loading: () => `${topbar()}<main class="wrap"><p class="muted center" style="margin-top:40px">Warming up…</p></main>`,
-    missing: () => `${topbar()}<main class="wrap stack" style="margin-top:24px"><section class="card stack"><h2>Group not found</h2><p>Check the link, or start your own group.</p><a class="btn hot" href="${location.pathname}">Go to Hoops Standings</a></section></main>`,
+    missing: () => {
+      const old = oldDemoGroup(S.gid);
+      if (old) return `${topbar()}<main class="wrap stack" style="margin-top:24px"><section class="card stack">
+        <p class="eyebrow">Restore group</p><h2>${esc(old.name)}</h2>
+        <p>You made this group before the site went live, so it was only saved on this device. Bring it back with the same link so your friends can join.</p>
+        <form id="restore" class="stack" autocomplete="off">${nameField('rname')}
+          ${S.err ? `<p class="err">${esc(S.err)}</p>` : ''}
+          <button class="btn hot big" ${S.busy ? 'disabled' : ''}>${S.busy ? 'Restoring…' : 'Restore group'}</button></form>
+      </section>${loginCard()}</main>`;
+      return `${topbar()}<main class="wrap stack" style="margin-top:24px"><section class="card stack"><h2>Group not found</h2><p>Check the link, or start your own group.</p><a class="btn hot" href="${location.pathname}">Go to Hoops Standings</a></section></main>`;
+    },
     error: () => `${topbar()}<main class="wrap stack" style="margin-top:24px"><section class="card stack"><h2>Something went wrong</h2><p>${esc(S.err)}</p><button class="btn" data-act="reload">Reload</button></section></main>` };
   $app.innerHTML = fns[S.view]();
   if (document.getElementById('calc-out')) calcUpdate();
 }
 
 /* ---------- navigation ---------- */
+// Groups created in demo mode (before the database was connected) live only in this browser.
+function oldDemoGroup(id) { const g = store.get('hs-localdb', null)?.groups?.[id]; return g && !isMain(id) ? g : null; }
+
 function go(url) { history.pushState(null, '', url); }
 
 async function openGroup(gid) {
@@ -785,8 +797,8 @@ $app.addEventListener('submit', async e => {
   const form = e.target.id;
   const fail = msg => { S.busy = false; S.err = msg; S.errFor = form; render(); };
   const val = id => document.getElementById(id)?.value.trim() || '';
-  const typed = val('sname') || val('jname') || val('myname');
-  const pin = val('sname-pin') || val('jname-pin') || val('myname-pin');
+  const typed = val('sname') || val('jname') || val('myname') || val('rname');
+  const pin = val('sname-pin') || val('jname-pin') || val('myname-pin') || val('rname-pin');
   try {
     if (form === 'start') {
       S.busy = true; render();
@@ -810,6 +822,14 @@ $app.addEventListener('submit', async e => {
       if (!S.members.some(m => m.uid === api.pid)) S.members.push({ uid: api.pid, name: S.profile.name, done: false });
       S.view = 'group'; S.tab = isLocked() ? 'board' : 'squad';
       if (isLocked()) render(); else startPick();
+    } else if (form === 'restore') {
+      const old = oldDemoGroup(S.gid);
+      S.busy = true; S.err = ''; render();
+      await ensureProfile(typed, pin);
+      await api.createGroup(old.name.slice(0, 40), S.gid);
+      S.busy = false;
+      await openGroup(S.gid);
+      toast('Group restored! Your old link works now.');
     } else if (form === 'login') {
       const code = val('lpin');
       S.busy = true; S.login.err = ''; render();
