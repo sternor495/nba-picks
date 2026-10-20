@@ -29,9 +29,10 @@ service cloud.firestore {
       allow create, update: if isPlayer(pid) && okName(request.resource.data.name);
     }
 
-    // One set of picks per player, used in every group. Secret until lock.
+    // One set of picks per player, used in every group. Readable so everyone's live score can be
+    // ranked; the site only shows other people's picks after lock.
     match /picks/{pid} {
-      allow read: if isPlayer(pid) || (signedIn() && locked());
+      allow read: if signedIn();
       allow create, update: if isPlayer(pid) && !locked()
         && request.resource.data.east.size() == 10
         && request.resource.data.west.size() == 10

@@ -25,6 +25,8 @@ const ord = n => n + (['th','st','nd','rd'][(n % 100 - 20) % 10] || ['th','st','
 const confTeams = c => TEAMS.filter(t => t.c === c);
 const CONF = { east: { key: 'E', name: 'East' }, west: { key: 'W', name: 'West' } };
 const isMain = id => id === MAIN.id;
+// Test players created while building the site; never shown in groups or rankings.
+const HIDDEN = new Set(['8nuxxz94jh', 'hvvjhzxcuu', 'p2ay6gv8jv']);
 
 /* ---------- scoring (the rules, in code) ---------- */
 const placeValue = p => 100 - 2 * (p - 1);                       // 1st 100 … 10th 82
@@ -135,7 +137,7 @@ function localApi() {
     },
     async getPicks() { return (pid && load().picks[pid]) || null; },
     async savePicks(p) { if (isLocked()) throw new Error('locked'); const db = load(); db.picks[pid] = p; db.players[pid].done = true; save(db); ping(); },
-    async allPicks() { const db = load(); return Object.entries(db.picks).filter(([u]) => isLocked() || u === pid).map(([u, e]) => ({ uid: u, ...e, name: db.players[u]?.name || '?' })); },
+    async allPicks() { const db = load(); return Object.entries(db.picks).map(([u, e]) => ({ uid: u, ...e, name: db.players[u]?.name || '?' })); },
   };
 }
 
@@ -213,7 +215,6 @@ async function firebaseApi(cfg) {
       await db.collection('players').doc(pid).set({ done: true }, { merge: true });
     },
     async allPicks() {
-      if (!isLocked()) { const e = await api.getPicks(); return e ? [{ uid: pid, ...e, name: players[pid]?.name }] : []; }
       const q = await db.collection('picks').get();
       return q.docs.map(d => ({ uid: d.id, ...d.data(), name: players[d.id]?.name || '?' }));
     },
@@ -453,7 +454,7 @@ function viewJoin() {
 }
 
 function viewGroup() {
-  const tabs = [['board', 'Leaderboard'], ['squad', 'Players'], ['mine', 'My picks'], ['rules', 'Rules']];
+  const tabs = [['squad', 'Standings'], ['board', 'Breakdown'], ['mine', 'My picks'], ['rules', 'Rules']];
   const body = { squad: tabSquad, mine: tabMine, board: tabBoard, rules: rulesHtml }[S.tab]();
   const done = S.members.filter(m => m.done).length;
   return `${topbar()}
@@ -468,18 +469,34 @@ function viewGroup() {
   </main>`;
 }
 
+function rankedMembers() {
+  const sc = Object.fromEntries((S.lb?.rows || []).map(r => [r.uid, r.sc.total]));
+  const withPicks = S.members.filter(m => sc[m.uid] != null).sort((a, b) => sc[b.uid] - sc[a.uid]);
+  const rest = S.members.filter(m => sc[m.uid] == null).sort((a, b) => (a.joinedAt || 0) - (b.joinedAt || 0));
+  let rank = 0, prev = null;
+  return [...withPicks.map((m, i) => { if (sc[m.uid] !== prev) { rank = i + 1; prev = sc[m.uid]; } return { ...m, rank, pts: sc[m.uid] }; }), ...rest];
+}
+
 function tabSquad() {
-  const ms = [...S.members].sort((a, b) => (a.joinedAt || 0) - (b.joinedAt || 0));
+  if (!S.lb && !S.lbErr) loadBoard();
+  const live = S.lb?.live, started = live?.started;
+  const ms = rankedMembers();
+  const medal = r => started ? ({ 1: '🥇', 2: '🥈', 3: '🥉' }[r] || r) : '–';
   return `
   ${!S.profile?.done && !isLocked() ? `<section class="card stack" style="border-color:var(--hot)"><h3>Your picks aren't in yet</h3><p class="muted">It takes about 5 minutes. You can change them until the end of October.</p><button class="btn hot big" data-act="pick">Make my picks</button></section>` : ''}
+  <section class="card">
+    <div class="row" style="margin-bottom:4px"><h3 class="grow">Standings</h3>${started ? `<span class="muted small">Projection · ${asOf(live.at)}</span>` : ''}</div>
+    <p class="muted small" style="margin-bottom:6px">${!S.lb ? 'Loading scores…' : live.final ? 'Final results.' : started ? 'If the season ended today. Updates every day.' : 'Rankings start after tonight\'s first games.'}</p>
+    ${ms.map(m => `<div class="mem">
+      <span class="rk num" style="width:30px;text-align:center;font-family:var(--display);font-weight:900;font-size:22px">${m.rank ? medal(m.rank) : ''}</span>
+      ${avatar(m.name)}<div class="grow" style="min-width:0"><b>${esc(m.name)}</b>${m.uid === S.group.owner ? ' <span class="muted small">· started the group</span>' : ''}${m.uid === api.pid ? ' <span class="muted small">· you</span>' : ''}</div>
+      ${m.pts != null ? `<b class="num" style="font-family:var(--display);font-size:24px">${fmt(m.pts)}</b>` : '<span class="badge wait">Thinking…</span>'}
+    </div>`).join('') || '<p class="muted">No one yet.</p>'}
+  </section>
   <section class="card stack">
     <h3>Invite link</h3>
     <p class="muted small">Anyone with this link can join. Send it in the group chat.</p>
     <div class="row" style="flex-wrap:wrap"><input class="txt grow small" id="invite-url" readonly value="${esc(inviteUrl())}" aria-label="Invite link" style="min-width:200px"><button class="btn hot" data-act="invite">Copy / share</button></div>
-  </section>
-  <section class="card">
-    <h3 style="margin-bottom:6px">Players</h3>
-    ${ms.map(m => `<div class="mem">${avatar(m.name)}<div class="grow"><b>${esc(m.name)}</b>${m.uid === S.group.owner ? ' <span class="muted small">· started the group</span>' : ''}${m.uid === api.pid ? ' <span class="muted small">· you</span>' : ''}</div>${m.done ? '<span class="badge ok">Picks in ✓</span>' : '<span class="badge wait">Thinking…</span>'}</div>`).join('') || '<p class="muted">No one yet.</p>'}
   </section>`;
 }
 
@@ -536,22 +553,13 @@ function picksTables(e, sc) {
 }
 
 function tabBoard() {
-  if (!isLocked()) {
-    const done = S.members.filter(m => m.done).length;
-    return `<section class="card stack center">
-      <h3>Sealed until the end of October</h3>
-      <p class="muted">${done} of ${S.members.length} have their picks in. Everyone's picks and the live leaderboard appear when picks lock.</p>
-      ${countdown(false).replace('class="clock', 'style="justify-content:center" class="clock')}
-    </section>
-    ${S.picks ? (() => { if (!S.live && !S.liveErr) loadLive(); return projectionCard(S.live?.started ? scoreEntry(S.picks, S.live) : null, S.live) + `<button class="btn" data-act="tab" data-v="mine">See my projection pick by pick</button>`; })() : ''}`;
-  }
   if (S.lbErr) return `<section class="card stack"><p class="err">${esc(S.lbErr)}</p><button class="btn" data-act="reload-lb">Try again</button></section>`;
   if (!S.lb) { loadBoard(); return `<section class="card center muted">Loading the scores…</section>`; }
   const { live } = S.lb;
   const inGroup = new Set(S.members.map(m => m.uid));
   const names = Object.fromEntries(S.members.map(m => [m.uid, m.name]));
   const rows = S.lb.rows.filter(r => inGroup.has(r.uid)).map(r => ({ ...r, name: names[r.uid] || r.name }));
-  if (!rows.length) return `<section class="card">No one in this group made picks.</section>`;
+  if (!rows.length) return `<section class="card">No one in this group has made picks yet.</section>`;
   const max = Math.max(1, ...rows.map(r => r.sc.total));
   let rank = 0, prev = null;
   return `<p class="muted small">${live.final ? 'Final results.' : live.started ? `<b>Projection:</b> if the season ended today. Standings as of ${asOf(live.at)}, win totals on an 82-game pace, player averages so far.` : 'Waiting for games, so everyone is at 0.'}</p>
@@ -566,7 +574,7 @@ function tabBoard() {
         <span class="grow" style="min-width:0"><b>${esc(r.name)}</b>${r.uid === api.pid ? ' <span class="muted small">· you</span>' : ''}
           <span class="bars"><i class="c1" style="width:${w(r.sc.eastPlace)}"></i><i class="c2" style="width:${w(r.sc.westPlace)}"></i><i class="c3" style="width:${w(r.sc.wins)}"></i><i class="c4" style="width:${w(r.sc.stats)}"></i></span></span>
         <span class="tot">${fmt(r.sc.total)}</span>
-      </button>${open ? `<div style="padding:4px 0 12px">${picksTables(r, live.started ? r.sc : null)}</div>` : ''}`;
+      </button>${open ? `<div style="padding:4px 0 12px">${isLocked() || r.uid === api.pid ? picksTables(r, live.started ? r.sc : null) : `<p class="muted small">${esc(r.name)}'s picks are revealed when picks lock on Oct 31. The points are live now.</p>`}</div>` : ''}`;
     }).join('')}</div>
   <button class="btn ghost" data-act="reload-lb">Refresh scores</button>`;
 }
@@ -701,7 +709,7 @@ async function openGroup(gid) {
   let first = true;
   await new Promise(res => {
     unsubMembers = api.watchMembers(gid, ms => {
-      S.members = ms;
+      S.members = ms.filter(m => !HIDDEN.has(m.uid) || m.uid === api.pid);
       if (first) { first = false; res(); }
       else if (S.view === 'group' || S.view === 'join') render();
     });
@@ -710,7 +718,7 @@ async function openGroup(gid) {
     // Known player: opening any group link joins it (and the main group).
     await Promise.all([api.joinGroup(gid), api.joinGroup(MAIN.id)]);
     rememberGroup(gid, g.name);
-    S.view = 'group'; S.tab = isLocked() ? 'board' : 'squad';
+    S.view = 'group'; S.tab = 'squad';
   } else S.view = 'join';
   render();
 }
@@ -801,7 +809,7 @@ $app.addEventListener('input', e => {
   const t = e.target;
   if (t.id === 'lq') {
     S.login.q = t.value; clearTimeout(lqT);
-    lqT = setTimeout(async () => { const q = S.login.q; const r = q.trim() ? await api.search(q).catch(() => []) : []; if (q !== S.login.q) return; S.login.results = r; const el = document.getElementById('lresults'); if (el) el.innerHTML = loginResults(); }, 250);
+    lqT = setTimeout(async () => { const q = S.login.q; const r = q.trim() ? await api.search(q).catch(() => []) : []; if (q !== S.login.q) return; S.login.results = r.filter(x => !HIDDEN.has(x.pid)); const el = document.getElementById('lresults'); if (el) el.innerHTML = loginResults(); }, 250);
     return;
   }
   if (t.id === 'psearch') { S.pq = t.value; document.getElementById('plist').innerHTML = playerListHtml(); return; }
@@ -842,7 +850,7 @@ $app.addEventListener('submit', async e => {
       await api.joinGroup(S.gid); rememberGroup(S.gid, S.group.name);
       S.busy = false;
       if (!S.members.some(m => m.uid === api.pid)) S.members.push({ uid: api.pid, name: S.profile.name, done: false });
-      S.view = 'group'; S.tab = isLocked() ? 'board' : 'squad';
+      S.view = 'group'; S.tab = 'squad';
       if (isLocked()) render(); else startPick();
     } else if (form === 'restore') {
       const old = oldDemoGroup(S.gid);
@@ -873,7 +881,7 @@ async function submit() {
   try {
     const p = { east: d.east, west: d.west, players: d.players, updatedAt: Date.now() };
     await api.savePicks(p);
-    S.picks = p; S.profile = { ...S.profile, done: true }; store.del(DRAFT);
+    S.picks = p; S.profile = { ...S.profile, done: true }; S.lb = null; store.del(DRAFT);
     S.busy = false;
     if (S.back === 'group' && S.group) { S.view = 'group'; S.tab = 'mine'; }
     else { go(`?g=${MAIN.id}`); await openGroup(MAIN.id); S.tab = 'mine'; }
