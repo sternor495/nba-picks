@@ -27,7 +27,7 @@ const CONF = { east: { key: 'E', name: 'East' }, west: { key: 'W', name: 'West' 
 const isMain = id => id === MAIN.id;
 
 /* ---------- scoring (the rules, in code) ---------- */
-const placeValue = p => 100 - 5 * (p - 1);                       // 1st 100 … 10th 55
+const placeValue = p => 100 - 2 * (p - 1);                       // 1st 100 … 10th 82
 function placeScore(slot, actual) {
   if (!actual || actual > 10) return 0;                           // missed the top 10
   if (actual === slot) return placeValue(slot);                   // exact: full value
@@ -35,14 +35,14 @@ function placeScore(slot, actual) {
 }
 function winsScore(guess, actual) {
   if (actual == null) return 0;
-  if (guess === actual) return actual;                            // exact: the win total itself
-  return Math.max(0, 10 - 4 * Math.floor(Math.abs(guess - actual) / 10));
+  if (guess === actual) return 100;                               // exact: 100
+  return [15, 10, 5][Math.floor(Math.abs(guess - actual) / 10)] || 0; // off by 1-9 / 10-19 / 20-29 / 30+
 }
 function statScore(guess, avg) {
   if (avg == null) return 0;
   const a = Math.round(avg);
-  if (guess === a) return a;                                      // exact: the number itself
-  return Math.max(0, 10 - Math.abs(guess - a));
+  if (guess === a) return 50;                                     // exact: 50
+  return Math.max(0, 20 - 5 * Math.abs(guess - a));             // otherwise 20 − 5 per point off
 }
 function scoreEntry(e, live) {
   const r = { east: [], west: [], players: [], place: 0, wins: 0, stats: 0, total: 0, eastPlace: 0, westPlace: 0 };
@@ -307,26 +307,26 @@ function rulesHtml() {
       <li><b>Wrong place, but they finish top 10:</b> half the value of the place they actually finished, minus 2 points for every place you were off.</li>
       <li><b>They miss the top 10:</b> 0 points.</li>
     </ul>
-    <p class="ex">You pick a team 1st and they finish 4th. 4th is worth 85, half is 42.5, minus 3 places × 2 = <b>36.5 points</b>.</p>
+    <p class="ex">You pick a team 1st and they finish 4th. 4th is worth 94, half is 47, minus 3 places × 2 = <b>41 points</b>.</p>
 
     <h3>2 · Win totals</h3>
     <p>For each of your 20 teams, predict their regular-season wins (out of 82).</p>
     <ul>
-      <li><b>Exact:</b> you score the win total itself. Nail a 57-win season and bank 57.</li>
-      <li><b>Off by 1–9:</b> 10 points.</li>
-      <li><b>Off by 10–19:</b> 6 points.</li>
-      <li><b>Off by 20–29:</b> 2 points.</li>
+      <li><b>Exact:</b> 100 points.</li>
+      <li><b>Off by 1–9:</b> 15 points.</li>
+      <li><b>Off by 10–19:</b> 10 points.</li>
+      <li><b>Off by 20–29:</b> 5 points.</li>
       <li><b>Off by 30+:</b> 0.</li>
     </ul>
-    <p class="ex">A team wins 43. You said 42 → <b>10</b>. 32 → <b>6</b>. 22 → <b>2</b>. 12 → <b>0</b>. 54 → <b>6</b>.</p>
+    <p class="ex">A team wins 43. You said 43 → <b>100</b>. 42 → <b>15</b>. 32 → <b>10</b>. 22 → <b>5</b>. 12 → <b>0</b>. 54 → <b>10</b>.</p>
 
     <h3>3 · Your starting five</h3>
     <p>Pick any 5 players and predict each one's season averages for points, rebounds and assists, in whole numbers. Real averages are rounded to the nearest whole number.</p>
     <ul>
-      <li><b>Exact:</b> you score the number itself. Call 27 points a game and he averages 27 → 27 points.</li>
-      <li><b>Otherwise:</b> 10 points minus 1 for every point you're off (never below 0).</li>
+      <li><b>Exact:</b> 50 points.</li>
+      <li><b>Otherwise:</b> 20 points minus 5 for every point you're off (never below 0). Off by 1 = 15, off by 2 = 10, off by 3 = 5, off by 4+ = 0.</li>
     </ul>
-    <p class="ex">He averages 22 and you said 20 → <b>8 points</b>. You said 9 assists and he averages 6 → <b>7</b>.</p>
+    <p class="ex">He averages 22 and you said 22 → <b>50</b>. You said 20 → <b>10</b>. You said 9 assists and he averages 6 → <b>5</b>.</p>
 
     <h3>Try it</h3>
     <div class="calc">
