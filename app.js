@@ -229,7 +229,7 @@ const S = {
   gid: null, group: null, members: [],
   tab: 'board', step: 0, draft: null, back: null,
   pq: '', ppos: 'All', openUid: null,
-  lb: null, lbErr: null, err: '', busy: false,
+  lb: null, lbErr: null, live: null, liveErr: null, err: '', busy: false,
   login: { q: '', results: [], sel: null, err: '' },
 };
 let unsubMembers = null;
@@ -488,10 +488,31 @@ function tabMine() {
     if (isLocked()) return `<section class="card"><p>You didn't make picks before the lock.</p></section>`;
     return `<section class="card stack center"><h3>No picks yet</h3><p class="muted">East, West, then your starting five.</p><button class="btn hot big" data-act="pick">Start picking</button></section>`;
   }
-  const live = S.lb?.live || null;
+  if (!S.live && !S.liveErr) loadLive();
+  const live = S.live;
   const sc = live?.started ? scoreEntry(S.picks, live) : null;
-  return `${!isLocked() ? `<div class="row"><p class="grow muted small">Saved. These count in all your groups. Change them until the end of October.</p><button class="btn" data-act="pick">Edit picks</button></div>` : ''}
+  return `${projectionCard(sc, live)}
+  ${!isLocked() ? `<div class="row"><p class="grow muted small">Saved. These count in all your groups. Change them until the end of October.</p><button class="btn" data-act="pick">Edit picks</button></div>` : ''}
   ${picksTables(S.picks, sc)}`;
+}
+
+const asOf = t => new Date(t).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+function projectionCard(sc, live) {
+  if (S.liveErr) return `<section class="card"><p class="muted">Couldn't load today's NBA numbers. Try again later.</p></section>`;
+  if (!live) return `<section class="card center muted">Loading today's projection…</section>`;
+  if (!live.started) return `<section class="card stack"><p class="eyebrow">Projection</p><h3>Starts after the first games</h3><p class="muted">Once games are played, this shows your score as if the season ended today. It updates every day.</p></section>`;
+  const parts = [['East places', sc.eastPlace, 'c1'], ['West places', sc.westPlace, 'c2'], ['Win totals', sc.wins, 'c3'], ['Starting five', sc.stats, 'c4']];
+  return `<section class="card stack">
+    <div class="row"><div class="grow"><p class="eyebrow">${live.final ? 'Final score' : 'Projection · if the season ended today'}</p><h2 class="num">${fmt(sc.total)} pts</h2></div></div>
+    <div class="legend">${parts.map(([l, v, c]) => `<span><i class="${c}"></i>${l} <b class="num">${fmt(v)}</b></span>`).join('')}</div>
+    <p class="muted small">${live.final ? 'The regular season is over.' : `Standings as of ${asOf(live.at)}. Win totals are projected to an 82-game pace. Player numbers are season averages so far. Green means you're right on as of today.`}</p>
+  </section>`;
+}
+let liveLoading = false;
+async function loadLive(force) {
+  if (liveLoading) return; liveLoading = true;
+  try { S.live = await getLive(force); S.liveErr = null; } catch (e) { console.error(e); S.liveErr = true; }
+  liveLoading = false; render();
 }
 
 function picksTables(e, sc) {
@@ -507,7 +528,7 @@ function picksTables(e, sc) {
     <h3>West</h3>${conf('west')}
     <h3>Starting five</h3>
     <div class="tbl"><table><thead><tr><th>Player</th><th>PTS</th><th>REB</th><th>AST</th>${sc ? '<th style="text-align:right">Pts</th>' : ''}</tr></thead><tbody>
-    ${prow.map(p => { const pl = playerBy[p.id]; const a = p.act; const cell = k => `${p[k]}${sc ? ` <span class="muted small">/ ${a ? fmt(a[k]) : '–'}</span>` : ''}`;
+    ${prow.map(p => { const pl = playerBy[p.id]; const a = p.act; const cell = k => `<span class="${sc && a && Math.round(a[k]) === p[k] ? 'hit' : ''}">${p[k]}</span>${sc ? ` <span class="muted small">/ ${a ? fmt(a[k]) : '–'}</span>` : ''}`;
       return `<tr><td><span class="row" style="gap:8px"><img src="${head(p.id)}" alt="" style="width:34px;height:25px;object-fit:cover;object-position:top;border-radius:4px">${esc(pl?.n || p.id)}</span></td><td>${cell('pts')}</td><td>${cell('reb')}</td><td>${cell('ast')}</td>${sc ? `<td class="pts">${fmt(p.sum)}</td>` : ''}</tr>`; }).join('')}
     </tbody></table></div>
     ${sc ? `<p class="muted small">Prediction / current average. Total: <b>${fmt(sc.total)}</b> points.</p>` : ''}
@@ -521,7 +542,8 @@ function tabBoard() {
       <h3>Sealed until the end of October</h3>
       <p class="muted">${done} of ${S.members.length} have their picks in. Everyone's picks and the live leaderboard appear when picks lock.</p>
       ${countdown(false).replace('class="clock', 'style="justify-content:center" class="clock')}
-    </section>`;
+    </section>
+    ${S.picks ? (() => { if (!S.live && !S.liveErr) loadLive(); return projectionCard(S.live?.started ? scoreEntry(S.picks, S.live) : null, S.live) + `<button class="btn" data-act="tab" data-v="mine">See my projection pick by pick</button>`; })() : ''}`;
   }
   if (S.lbErr) return `<section class="card stack"><p class="err">${esc(S.lbErr)}</p><button class="btn" data-act="reload-lb">Try again</button></section>`;
   if (!S.lb) { loadBoard(); return `<section class="card center muted">Loading the scores…</section>`; }
@@ -532,7 +554,7 @@ function tabBoard() {
   if (!rows.length) return `<section class="card">No one in this group made picks.</section>`;
   const max = Math.max(1, ...rows.map(r => r.sc.total));
   let rank = 0, prev = null;
-  return `<p class="muted small">${live.final ? 'Final results.' : live.started ? 'Live: if the season ended today. Updated from ESPN.' : 'Waiting for games, so everyone is at 0.'}</p>
+  return `<p class="muted small">${live.final ? 'Final results.' : live.started ? `<b>Projection:</b> if the season ended today. Standings as of ${asOf(live.at)}, win totals on an 82-game pace, player averages so far.` : 'Waiting for games, so everyone is at 0.'}</p>
   <div class="legend"><span><i class="c1"></i>East places</span><span><i class="c2"></i>West places</span><span><i class="c3"></i>Win totals</span><span><i class="c4"></i>Starting five</span></div>
   <div class="lb">${rows.map((r, i) => {
       if (r.sc.total !== prev) { rank = i + 1; prev = r.sc.total; }
@@ -747,7 +769,7 @@ $app.addEventListener('click', async e => {
     case 'invite': invite(); break;
     case 'pick': startPick(); break;
     case 'reload': location.reload(); break;
-    case 'reload-lb': S.lb = null; S.lbErr = null; render(); loadBoard(true); break;
+    case 'reload-lb': S.lb = null; S.lbErr = null; S.live = null; render(); loadBoard(true); loadLive(true); break;
     case 'open': S.openUid = S.openUid === v ? null : v; render(); break;
     case 'cancel-pick': S.view = S.back || 'home'; render(); break;
     case 'prev': S.step--; render(); scrollTo(0, 0); break;
